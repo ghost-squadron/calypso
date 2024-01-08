@@ -1,0 +1,25 @@
+version: "3"
+
+services:
+  gsag-calypso:
+    build: .
+    image: gsag-calypso
+    environment:
+      MONGODB_DOMAIN: "mongodb"
+    restart: "unless-stopped"
+    networks:
+      - gsag-calypso
+    depends_on:
+      - mongodb
+
+  mongodb:
+    image: mongo:6-jammy
+    expose:
+      - 27017
+    volumes:
+      - ./db:/data/db
+    networks:
+      - gsag-calypso
+
+networks:
+  gsag-calypso:
