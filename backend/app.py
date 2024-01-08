@@ -8,7 +8,6 @@ import dotenv
 import httpx
 import pymongo
 from bs4 import BeautifulSoup, NavigableString, Tag
-from discord.ext.commands import guild_only, has_permissions
 from loguru import logger
 from pydantic import BaseModel
 
@@ -39,7 +38,37 @@ class RSIUser(BaseModel):
     image: str
 
 
-def rsi_lookup(url: str) -> int | str | discord.Embed:
+def find_or_except(
+    soup: BeautifulSoup | Tag, key: str | None, value: str, desc: str
+) -> Tag:
+    if key:
+        res = soup.find(attrs={key: value})
+    else:
+        res = soup.find(value)
+    if not isinstance(res, Tag):
+        raise Exception(f'Could not find {key if key else ""} "{value}" on "{desc}"')
+    return res
+
+
+def find_child_or_except(
+    soup: BeautifulSoup | Tag,
+    value: str,
+    index: int,
+    desc: str,
+    recursive: bool = False,
+) -> Tag:
+    res = soup.findChildren(value, recursive=recursive)
+    if len(res) < index + 1:
+        raise Exception(
+            f'Expected at least {index+1} children on "{value}" on "{desc}" but found {len(res)}'
+        )
+    res_i = res[index]
+    if not isinstance(res_i, Tag):
+        raise Exception(f'Could not find child {index} on "{value}" on "{desc}"')
+    return res_i
+
+
+def rsi_lookup(url: str) -> int | discord.Embed:
     r = httpx.get(url)
 
     if not r.is_success:
@@ -47,83 +76,67 @@ def rsi_lookup(url: str) -> int | str | discord.Embed:
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    content = soup.find(attrs={"id": "public-profile"})
-    if not isinstance(content, Tag):
-        return f'Could not find id "public-profile" on page: "{url}"'
+    embed = discord.Embed()
 
-    info = content.find(attrs={"class": "info"})
-    if not isinstance(info, Tag):
-        return f'Could not find class "info" on page: "{url}"'
+    public_profile = find_or_except(soup, "id", "public-profile", "page")
 
-    info_children = info.findChildren("p", recursive=False)
-    if len(info_children) < 2 or not isinstance(info_children[1], Tag):
-        return f'Could not find class "info" children on page: "{url}"'
+    # Extract user "Handle name"
+    info_tag = find_or_except(public_profile, "class", "info", "public-profile")
+    handle_parent_tag = find_child_or_except(info_tag, "p", 1, "info")
+    handle = find_or_except(
+        handle_parent_tag, None, "strong", "handle parent"
+    ).text.strip()
+    embed.title = handle
+    embed.url = RSI_BASE_URL + urllib.parse.quote(handle)
 
-    handle_tag = info_children[1].find("strong")
-    if not isinstance(handle_tag, Tag):
-        return f'Could not find handle name on page: "{url}"'
+    # Extract user badge
+    badge_parent_tag = find_child_or_except(info_tag, "p", 2, "info")
+    badge_icon_url = find_or_except(badge_parent_tag, None, "img", "info badge img")[
+        "src"
+    ]
+    if not isinstance(badge_icon_url, str):
+        raise Exception(f'Could not get src from "badge" img on page: "{url}"')
+    if not badge_icon_url.startswith("http"):
+        badge_icon_url = "https://robertsspaceindustries.com" + badge_icon_url
+    badge_text = find_child_or_except(
+        badge_parent_tag, "span", 1, "info badge text"
+    ).text.strip()
+    embed.set_footer(text=f"{badge_text} • Enlisted", icon_url=badge_icon_url)
 
-    thumb = content.find(attrs={"class": "thumb"})
-    if not isinstance(thumb, Tag):
-        return f'Could not find class "thumb" on page: "{url}"'
+    # Extract profile image
+    thumb_tag = find_or_except(public_profile, "class", "thumb", "public-profile")
+    image = find_child_or_except(thumb_tag, "img", 0, "thumb")["src"]
+    if not isinstance(image, str):
+        raise Exception(f'Could not get src from "thumb" img on page: "{url}"')
+    if not image.startswith("http"):
+        image = "https://robertsspaceindustries.com" + image
+    embed.set_image(url=image)
 
-    thumb_children = thumb.findChildren("img", recursive=False)
-    if len(thumb_children) < 1 or not isinstance(thumb_children[0], Tag):
-        return f'Could not find class "thumb" children on page: "{url}"'
+    # Extract "UEE Citizen Record" id
+    citizen_record_tag = find_or_except(
+        public_profile, "class", "citizen-record", "public-profile"
+    )
+    citizen_record_id = find_child_or_except(
+        citizen_record_tag, "strong", 0, "citizen-record"
+    ).text.strip()
+    if citizen_record_id != "n/a":
+        embed.description = f"UEE Citizen Record **{citizen_record_id}**"
 
-    citizen_record = content.find(attrs={"class": "citizen-record"})
-    if not isinstance(citizen_record, Tag):
-        return f'Could not find class "citizen_record" on page: "{url}"'
-
-    citizen_record_children = citizen_record.findChildren("strong", recursive=False)
-    if len(citizen_record_children) < 1 or not isinstance(
-        citizen_record_children[0], Tag
-    ):
-        return f'Could not find class "citizen_record" children on page: "{url}"'
-
-    main_org_tag = content.find(attrs={"class": "main-org"})
-    if not isinstance(main_org_tag, Tag):
-        return f'Could not find class "main-org" on page: "{url}"'
-
+    # Extract main org
+    main_org_tag = find_or_except(public_profile, "class", "main-org", "publi-profile")
     main_org_img = main_org_tag.find("img")
     main_org_link = main_org_tag.find("a")
     main_org_info = main_org_tag.find(attrs={"class": "info"})
-    main_org: None | str = None
 
-    if isinstance(main_org_info, Tag):
-        main_org_info_children = main_org_info.findChildren("p", recursive=False)
-        if len(main_org_info_children) and isinstance(main_org_info_children[0], Tag):
-            main_org = main_org_info_children[0].text.strip()
+    if (
+        isinstance(main_org_img, Tag)
+        and isinstance(main_org_link, Tag)
+        and isinstance(main_org_info, Tag)
+    ):
+        main_org = find_child_or_except(
+            main_org_info, "p", 0, "main-org info"
+        ).text.strip()
 
-    left_col = content.find_all(attrs={"class": "left-col"})[-1]
-    image = thumb_children[0]["src"]
-
-    if not isinstance(image, str):
-        return f'Could not get src from "thumb" img on page: "{url}"'
-
-    if not image.startswith("http"):
-        image = "https://robertsspaceindustries.com" + image
-
-    enlisted = datetime.datetime.strptime(
-        left_col.find_all(attrs={"class": "value"})[0].text.strip(), "%b %d, %Y"
-    )
-    citizen_record_id = citizen_record_children[0].text.strip()
-
-    handle = handle_tag.text.strip()
-    embed_url = RSI_BASE_URL + urllib.parse.quote(handle)
-
-    embed = discord.Embed(
-        title=handle,
-        description=f"UEE Citizen Record **{citizen_record_id}**"
-        if citizen_record_id != "n/a"
-        else None,
-        url=embed_url,
-        timestamp=enlisted,
-    )
-    embed.set_image(url=image)
-    embed.set_footer(text="Enlisted")
-
-    if isinstance(main_org_img, Tag) and isinstance(main_org_link, Tag) and main_org:
         main_org_image_url = main_org_img["src"]
         assert isinstance(main_org_image_url, str)
         if not main_org_image_url.startswith("http"):
@@ -139,6 +152,13 @@ def rsi_lookup(url: str) -> int | str | discord.Embed:
         embed.set_author(
             name=f"Main Org: {main_org}", url=main_org_href, icon_url=main_org_image_url
         )
+
+    # Extract enlisted timestamp
+    left_col = public_profile.find_all(attrs={"class": "left-col"})[-1]
+    embed.timestamp = datetime.datetime.strptime(
+        left_col.find_all(attrs={"class": "value"})[0].text.strip(), "%b %d, %Y"
+    )
+
     return embed
 
 
@@ -189,14 +209,18 @@ def get_wrong_nicks(guild: discord.Guild) -> list[tuple]:
     return wrong_nicks
 
 
+# ======== PUBLIC COMMANDS ========
 @tree.command(name="profile", description="Add/update your linked RSI profile")
 async def profile(interaction: discord.Interaction, username: str) -> None:
-    user = rsi_lookup(RSI_BASE_URL + username)
-    if isinstance(user, int):
+    url = RSI_BASE_URL + username
+    try:
+        user = rsi_lookup(url)
+    except Exception as e:
         await interaction.response.send_message(
-            f'Could not find "{username}", please type your exact username (case insensitive) from https://robertsspaceindustries.com'
+            f"An error happened, please contact an admin and send them the following: {url} | {e}"
         )
-    elif isinstance(user, discord.Embed):
+
+    if isinstance(user, discord.Embed):
         db_user = {"_id": interaction.user.id, "url": user.url, "nick": user.title}
         try:
             USERS_COLLECTION.insert_one(db_user)
@@ -218,10 +242,57 @@ async def profile(interaction: discord.Interaction, username: str) -> None:
         )
     else:
         await interaction.response.send_message(
+            f'Could not find "{username}", please type your exact username (case insensitive) from https://robertsspaceindustries.com'
+        )
+
+
+@tree.command(
+    name="whois",
+    description="Looks up the RSI profile linked to a specific discord member",
+)
+async def whois(interaction: discord.Interaction, member: discord.Member) -> None:
+    db_user = USERS_COLLECTION.find_one({"_id": member.id})
+
+    if db_user:
+        try:
+            user = rsi_lookup(db_user["url"])
+        except Exception as e:
+            await interaction.response.send_message(
+                f"An error happened, please contact an admin and send them the following: {db_user['url']} | {e}"
+            )
+            return
+
+        if isinstance(user, discord.Embed):
+            await interaction.response.send_message(embed=user)
+        else:
+            await interaction.response.send_message(
+                f'User {member.mention} has invalid URL ({db_user["url"]}) please update immediately via `{PREFIX}profile username`'
+            )
+
+    else:
+        await interaction.response.send_message(
+            f"{member.mention} has not yet linked their RSI profile, please do so via `{PREFIX}profile username`"
+        )
+
+
+@tree.command(
+    name="lookup",
+    description="Looks up an RSI profile (must be exact match, case insensitive)",
+)
+async def lookup(interaction: discord.Interaction, lookup: str) -> None:
+    url = RSI_BASE_URL + lookup
+    user = rsi_lookup(url)
+    if isinstance(user, int):
+        await interaction.response.send_message(f'No profile found on "{url}"')
+    elif isinstance(user, discord.Embed):
+        await interaction.response.send_message(embed=user)
+    else:
+        await interaction.response.send_message(
             f"An error happened, please contact an admin and send them the following: {user}"
         )
 
 
+# ======== ADMIN COMMANDS ========
 @tree.command(
     name="addrole",
     description="Adds or updates a role and its icon to the prioritized list of role icons used during user renaming",
@@ -558,50 +629,6 @@ async def listtriggers(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(
         "Trigger roles:\n" + "\n".join(f'- <@&{j["_id"]}>' for j in trigger_roles)
     )
-
-
-@tree.command(
-    name="whois",
-    description="Looks up the RSI profile linked to a specific discord member",
-)
-@guild_only()
-async def whois(interaction: discord.Interaction, member: discord.Member) -> None:
-    db_user = USERS_COLLECTION.find_one({"_id": member.id})
-
-    if db_user:
-        user = rsi_lookup(db_user["url"])
-        if isinstance(user, int):
-            await interaction.response.send_message(
-                f'User {member.mention} has invalid URL ({db_user["url"]}) please update immediately via `{PREFIX}profile username`'
-            )
-        elif isinstance(user, discord.Embed):
-            await interaction.response.send_message(embed=user)
-        else:
-            await interaction.response.send_message(
-                f"An error happened, please contact an admin and send them the following: {user}"
-            )
-    else:
-        await interaction.response.send_message(
-            f"{member.mention} has not yet linked their RSI profile, please do so via `{PREFIX}profile username`"
-        )
-
-
-@tree.command(
-    name="lookup",
-    description="Looks up an RSI profile (must be exact match, case insensitive)",
-)
-@guild_only()
-async def lookup(interaction: discord.Interaction, lookup: str) -> None:
-    url = RSI_BASE_URL + lookup
-    user = rsi_lookup(url)
-    if isinstance(user, int):
-        await interaction.response.send_message(f'No profile found on "{url}"')
-    elif isinstance(user, discord.Embed):
-        await interaction.response.send_message(embed=user)
-    else:
-        await interaction.response.send_message(
-            f"An error happened, please contact an admin and send them the following: {user}"
-        )
 
 
 class LetInButton(discord.ui.Button):
