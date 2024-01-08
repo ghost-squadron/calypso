@@ -123,7 +123,7 @@ def rsi_lookup(url: str) -> int | discord.Embed:
         embed.description = f"UEE Citizen Record **{citizen_record_id}**"
 
     # Extract main org
-    main_org_tag = find_or_except(public_profile, "class", "main-org", "publi-profile")
+    main_org_tag = find_or_except(public_profile, "class", "main-org", "public-profile")
     main_org_img = main_org_tag.find("img")
     main_org_link = main_org_tag.find("a")
     main_org_info = main_org_tag.find(attrs={"class": "info"})
@@ -133,9 +133,10 @@ def rsi_lookup(url: str) -> int | discord.Embed:
         and isinstance(main_org_link, Tag)
         and isinstance(main_org_info, Tag)
     ):
-        main_org = find_child_or_except(
-            main_org_info, "p", 0, "main-org info"
-        ).text.strip()
+        main_org = (
+            find_child_or_except(main_org_info, "p", 0, "main-org info").text.strip()
+            or "[REDACTED]"
+        )
 
         main_org_image_url = main_org_img["src"]
         assert isinstance(main_org_image_url, str)
@@ -152,6 +153,14 @@ def rsi_lookup(url: str) -> int | discord.Embed:
         embed.set_author(
             name=f"Main Org: {main_org}", url=main_org_href, icon_url=main_org_image_url
         )
+    # Extract bio
+    bio_tag = public_profile.find(attrs={"class": "bio"})
+    if isinstance(bio_tag, Tag):
+        bio_body_tag = bio_tag.find("div")
+        if isinstance(bio_body_tag, Tag):
+            embed.description = (
+                embed.description or "" + f"\n\n**Bio:**\n{bio_body_tag.text.strip()}"
+            )
 
     # Extract enlisted timestamp
     left_col = public_profile.find_all(attrs={"class": "left-col"})[-1]
