@@ -31,13 +31,6 @@ client = discord.Client(command_prefix=PREFIX, intents=discord.Intents.all())
 tree = discord.app_commands.CommandTree(client)
 
 
-class RSIUser(BaseModel):
-    url: str
-    user_name: str
-    enlisted: datetime.datetime
-    image: str
-
-
 def find_or_except(
     soup: BeautifulSoup | Tag, key: str | None, value: str, desc: str
 ) -> Tag:
@@ -101,7 +94,7 @@ def rsi_lookup(url: str) -> int | discord.Embed:
     badge_text = find_child_or_except(
         badge_parent_tag, "span", 1, "info badge text"
     ).text.strip()
-    embed.set_footer(text=f"{badge_text} • Enlisted", icon_url=badge_icon_url)
+    embed.set_footer(text=f"{badge_text} │ Enlisted", icon_url=badge_icon_url)
 
     # Extract profile image
     thumb_tag = find_or_except(public_profile, "class", "thumb", "public-profile")
@@ -158,9 +151,7 @@ def rsi_lookup(url: str) -> int | discord.Embed:
     if isinstance(bio_tag, Tag):
         bio_body_tag = bio_tag.find("div")
         if isinstance(bio_body_tag, Tag):
-            embed.description = (
-                embed.description or "" + f"\n\n**Bio:**\n{bio_body_tag.text.strip()}"
-            )
+            embed.add_field(name="Bio", value=bio_body_tag.text.strip())
 
     # Extract enlisted timestamp
     left_col = public_profile.find_all(attrs={"class": "left-col"})[-1]
@@ -290,15 +281,37 @@ async def whois(interaction: discord.Interaction, member: discord.Member) -> Non
 )
 async def lookup(interaction: discord.Interaction, lookup: str) -> None:
     url = RSI_BASE_URL + lookup
-    user = rsi_lookup(url)
-    if isinstance(user, int):
-        await interaction.response.send_message(f'No profile found on "{url}"')
-    elif isinstance(user, discord.Embed):
+    try:
+        user = rsi_lookup(url)
+    except Exception as e:
+        await interaction.response.send_message(
+            f"An error happened, please contact an admin and send them the following: {url} | {e}"
+        )
+        return
+
+    if isinstance(user, discord.Embed):
         await interaction.response.send_message(embed=user)
     else:
+        await interaction.response.send_message(f'No profile found on "{url}"')
+
+
+async def check_admin(interaction: discord.Interaction) -> bool:
+    if (
+        not isinstance(interaction.user, discord.Member)
+        or not interaction.user.guild_permissions.administrator
+    ):
+        await interaction.response.send_message("Command only available for admins!")
+        return False
+    return True
+
+
+async def check_guild(interaction: discord.Interaction) -> bool:
+    if not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message(
-            f"An error happened, please contact an admin and send them the following: {user}"
+            "Command only available inside guilds (aka. Discord servers)!"
         )
+        return False
+    return True
 
 
 # ======== ADMIN COMMANDS ========
@@ -306,10 +319,12 @@ async def lookup(interaction: discord.Interaction, lookup: str) -> None:
     name="addrole",
     description="Adds or updates a role and its icon to the prioritized list of role icons used during user renaming",
 )
-@discord.app_commands.checks.has_permissions(administrator=True)
 async def addrole(
     interaction: discord.Interaction, role: discord.Role, icon: str, priority: int
 ) -> None:
+    if not await check_admin(interaction):
+        return
+
     db_role = {"_id": role.id, "icon": icon, "priority": priority}
     try:
         ROLES_COLLECTION.insert_one(db_role)
@@ -327,10 +342,12 @@ async def addrole(
     name="addwing",
     description="Adds or updates a wing-role and its icon used during user renaming",
 )
-@discord.app_commands.checks.has_permissions(administrator=True)
 async def addwing(
     interaction: discord.Interaction, role: discord.Role, icon: str
 ) -> None:
+    if not await check_admin(interaction):
+        return
+
     db_role = {"_id": role.id, "icon": icon}
     try:
         WINGS_COLLECTION.insert_one(db_role)
@@ -346,8 +363,10 @@ async def addwing(
     name="delrole",
     description="Removes a role used during user renaming",
 )
-@discord.app_commands.checks.has_permissions(administrator=True)
 async def delrole(interaction: discord.Interaction, role: discord.Role) -> None:
+    if not await check_admin(interaction):
+        return
+
     res = ROLES_COLLECTION.delete_one({"_id": role.id})
 
     if not res.deleted_count:
@@ -362,8 +381,10 @@ async def delrole(interaction: discord.Interaction, role: discord.Role) -> None:
     name="delwing",
     description="Removes a wing-role used during user renaming",
 )
-@discord.app_commands.checks.has_permissions(administrator=True)
 async def delwing(interaction: discord.Interaction, role: discord.Role) -> None:
+    if not await check_admin(interaction):
+        return
+
     res = WINGS_COLLECTION.delete_one({"_id": role.id})
 
     if not res.deleted_count:
@@ -378,8 +399,10 @@ async def delwing(interaction: discord.Interaction, role: discord.Role) -> None:
     name="listroles",
     description="List all roles used during user renaming",
 )
-@discord.app_commands.checks.has_permissions(administrator=True)
 async def listroles(interaction: discord.Interaction) -> None:
+    if not await check_admin(interaction):
+        return
+
     roles: list[dict] = list(
         sorted(ROLES_COLLECTION.find(), key=lambda r: r["priority"])
     )
@@ -402,8 +425,10 @@ async def listroles(interaction: discord.Interaction) -> None:
     name="listwings",
     description="List all wings used during user renaming",
 )
-@discord.app_commands.checks.has_permissions(administrator=True)
 async def listwings(interaction: discord.Interaction) -> None:
+    if not await check_admin(interaction):
+        return
+
     wings: list[dict] = list(WINGS_COLLECTION.find())
     if not wings:
         await interaction.response.send_message("No wings added yet")
@@ -418,8 +443,10 @@ async def listwings(interaction: discord.Interaction) -> None:
     name="status",
     description="Get status report for members of guild",
 )
-@discord.app_commands.checks.has_permissions(administrator=True)
 async def status(interaction: discord.Interaction) -> None:
+    if not await check_admin(interaction):
+        return
+
     assert interaction.guild
 
     missing_members = get_members_with_missing_rsi_profiles(interaction.guild)
@@ -461,8 +488,10 @@ ASK_MSG = '## Hi {member}! "{guild_name}" seems to be missing some information a
     name="ask",
     description="One member of the Guild to update their linked RSI profile",
 )
-@discord.app_commands.checks.has_permissions(administrator=True)
 async def ask(interaction: discord.Interaction, member: discord.Member) -> None:
+    if not await check_admin(interaction):
+        return
+
     assert interaction.guild
 
     await member.send(
@@ -479,8 +508,10 @@ async def ask(interaction: discord.Interaction, member: discord.Member) -> None:
     name="askall",
     description="Ask all members of the Guild with missing RSI profile to add it",
 )
-@discord.app_commands.checks.has_permissions(administrator=True)
 async def askall(interaction: discord.Interaction) -> None:
+    if not await check_admin(interaction):
+        return
+
     assert interaction.guild
 
     missing_members = get_members_with_missing_rsi_profiles(interaction.guild)
@@ -492,7 +523,9 @@ async def askall(interaction: discord.Interaction) -> None:
         await msg.edit(content=f"Asked {i}/{len(missing_members)} members...")
         await member.send(
             ASK_MSG.format(
-                member=member.mention, guild_name=interaction.guild.name, prefix=PREFIX
+                member=member.mention,
+                guild_name=interaction.guild.name,
+                prefix=PREFIX,
             )
         )
 
@@ -505,8 +538,10 @@ async def askall(interaction: discord.Interaction) -> None:
     name="updateall",
     description="Update the server nicknames of all members of the Guild to match their RSI profile and role icon",
 )
-@discord.app_commands.checks.has_permissions(administrator=True)
 async def updateall(interaction: discord.Interaction) -> None:
+    if not await check_admin(interaction):
+        return
+
     assert interaction.guild
 
     wrong_nicks = get_wrong_nicks(interaction.guild)
@@ -536,10 +571,12 @@ async def updateall(interaction: discord.Interaction) -> None:
     name="adminchal",
     description="Set the admin channel",
 )
-@discord.app_commands.checks.has_permissions(administrator=True)
 async def adminchal(
     interaction: discord.Interaction, channel: discord.TextChannel
 ) -> None:
+    if not await check_admin(interaction):
+        return
+
     assert interaction.guild
 
     try:
@@ -558,8 +595,10 @@ async def adminchal(
     name="startrole",
     description="Set the starting role",
 )
-@discord.app_commands.checks.has_permissions(administrator=True)
 async def startrole(interaction: discord.Interaction, role: discord.Role) -> None:
+    if not await check_admin(interaction):
+        return
+
     assert interaction.guild
 
     try:
@@ -574,10 +613,12 @@ async def startrole(interaction: discord.Interaction, role: discord.Role) -> Non
     name="addjoin",
     description="Adds or updates texts for user joining roles",
 )
-@discord.app_commands.checks.has_permissions(administrator=True)
 async def addjoin(
     interaction: discord.Interaction, role: discord.Role, text: str
 ) -> None:
+    if not await check_admin(interaction):
+        return
+
     try:
         JOIN_COLLECTION.insert_one({"_id": role.id, "text": text})
         await interaction.response.send_message(
@@ -594,8 +635,10 @@ async def addjoin(
     name="listjoin",
     description="List all current texts for user joining roles",
 )
-@discord.app_commands.checks.has_permissions(administrator=True)
 async def listjoin(interaction: discord.Interaction) -> None:
+    if not await check_admin(interaction):
+        return
+
     join_texts: list[dict] = list(JOIN_COLLECTION.find())
     if not join_texts:
         await interaction.response.send_message("No join texts added yet")
@@ -611,8 +654,10 @@ async def listjoin(interaction: discord.Interaction) -> None:
     name="addtrigger",
     description="Adds a trigger role",
 )
-@discord.app_commands.checks.has_permissions(administrator=True)
 async def addtrigger(interaction: discord.Interaction, role: discord.Role) -> None:
+    if not await check_admin(interaction):
+        return
+
     assert interaction.guild
 
     try:
@@ -628,8 +673,10 @@ async def addtrigger(interaction: discord.Interaction, role: discord.Role) -> No
     name="listtriggers",
     description="List all current trigger roles",
 )
-@discord.app_commands.checks.has_permissions(administrator=True)
 async def listtriggers(interaction: discord.Interaction) -> None:
+    if not await check_admin(interaction):
+        return
+
     trigger_roles: list[dict] = list(TRIGGER_COLLECTION.find())
     if not trigger_roles:
         await interaction.response.send_message("No trigger roles added yet")
@@ -640,6 +687,7 @@ async def listtriggers(interaction: discord.Interaction) -> None:
     )
 
 
+# ======== EVENTS ========
 class LetInButton(discord.ui.Button):
     def __init__(self, member_id: int, label: str, style: discord.ButtonStyle):
         self.member_id = member_id
@@ -662,6 +710,18 @@ class LetInButton(discord.ui.Button):
                         content=f"## {interaction.user.mention} let {member.mention} in, giving them the starting role {role.mention}",
                         view=None,
                     )
+            elif not startrole:
+                await interaction.response.edit_message(
+                    content=f"## ERROR: missing start role, please set it with `{PREFIX}startrole`",
+                )
+            else:
+                await interaction.response.edit_message(
+                    content=f'## ERROR: could not find member with id "{self.member_id}" in {interaction.guild.name}',
+                )
+        else:
+            logger.warning(
+                f"LetInButton instantiazed outside Guild: {self.member_id} | {interaction}"
+            )
 
 
 class KickButton(discord.ui.Button):
@@ -711,7 +771,7 @@ async def on_member_update(before: discord.Member, after: discord.Member) -> Non
 
                 after_role_ids = [r.id for r in after.roles]
                 embed = discord.Embed(
-                    title=f"{after.mention} just joined!\n",
+                    title=after.name,
                     description=f"What we know about them:\n"
                     + "\n".join(
                         f'- {j["text"]}'
@@ -719,7 +779,10 @@ async def on_member_update(before: discord.Member, after: discord.Member) -> Non
                         if j["_id"] in after_role_ids
                     ),
                 )
-                await channel.send(embed=embed, view=view)
+                embed.set_image(url=after.avatar)
+                await channel.send(
+                    content=f"## {after.mention} just joined!", embed=embed, view=view
+                )
 
 
 @client.event
