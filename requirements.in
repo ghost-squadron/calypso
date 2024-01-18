@@ -2,8 +2,11 @@ beautifulsoup4
 discord
 httpx
 loguru
+markdownify
 mypy
 pydantic
 pymongo
+PyNaCl
 python-dotenv
+sentence-transformers
 types-beautifulsoup4
