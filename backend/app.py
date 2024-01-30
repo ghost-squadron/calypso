@@ -1,36 +1,26 @@
 import asyncio
 import datetime
-import json
-import os
-import pathlib
-import string
-import sys
-import time
+import enum
 import math
+import pathlib
+import time
 import typing
-import urllib.parse
+import urllib
 import uuid
 
 import discord
-import dotenv
 import httpx
-import markdownify  # type: ignore
 import numpy
-import numpy.typing
-import pydantic
 import pymongo
-import sympy
-from bs4 import BeautifulSoup, PageElement, Tag
+from buttons import (DisplayOrgButton, GenericShowEmbedButton, KickButton,
+                     SnareCheckButton, UpdateAllButton)
+from classes import Organisation, ParsingException, Profile
+from constants import *
 from loguru import logger
-
-# from sentence_transformers import SentenceTransformer, util  # type: ignore
-
-dotenv.load_dotenv()
-
-DISCORD_API_TOKEN: str = os.environ["DISCORD_API_TOKEN"]
-ELEVENLABS_API_KEY: str = os.environ["ELEVENLABS_API_KEY"]
-RSI_BASE_URL = "https://robertsspaceindustries.com/citizens/"
-MONGODB_DOMAIN = os.environ.get("MONGODB_DOMAIN", default="localhost")
+from rsi_profile import (extract_profile_info, org_to_embed, orgs_lookup,
+                         profile_to_embed, url_to_org)
+from snare import (line_point_dist, perpendicular_unit_vector,
+                   point_point_dist, pretty_print_dist)
 
 mongodb_client: pymongo.MongoClient = pymongo.MongoClient(MONGODB_DOMAIN, 27017)
 DB = mongodb_client["database"]
@@ -40,127 +30,46 @@ WINGS_COLLECTION = DB["wings"]
 CONFIG_COLLECTION = DB["config"]
 JOIN_COLLECTION = DB["join"]
 TRIGGER_COLLECTION = DB["trigger"]
-PREFIX = "/"
 
-# Command descriptions
-PROFILE_DESCRIPTION = "Add/update your linked RSI profile"
-WHOIS_DESCRIPTION = "Looks up the RSI profile linked to a specific discord member"
-LOOKUP_DESCRIPTION = "Looks up an RSI profile (must be exact match, case insensitive)"
-SNARE_DESCRIPTION = "Command for assisting in planning where to set up your snare to *actually* catch everyone"
 
 client = discord.Client(command_prefix=PREFIX, intents=discord.Intents.all())
 tree = discord.app_commands.CommandTree(client)
 
-ACTIVITY_LOOKUP = {
-    "Bounty Hunting": (discord.ButtonStyle.green, discord.Colour.green()),
-    "Engineering": (discord.ButtonStyle.blurple, discord.Colour.blurple()),
-    "Exploration": (discord.ButtonStyle.blurple, discord.Colour.blurple()),
-    "Freelancing": (discord.ButtonStyle.gray, discord.Colour.from_str("#888888")),
-    "Infiltration": (discord.ButtonStyle.gray, discord.Colour.from_str("#888888")),
-    "Medical": (discord.ButtonStyle.blurple, discord.Colour.blurple()),
-    "Piracy": (discord.ButtonStyle.red, discord.Colour.red()),
-    "Resources": (discord.ButtonStyle.blurple, discord.Colour.blurple()),
-    "Scouting": (discord.ButtonStyle.green, discord.Colour.green()),
-    "Security": (discord.ButtonStyle.green, discord.Colour.green()),
-    "Smuggling": (discord.ButtonStyle.red, discord.Colour.red()),
-    "Social": (discord.ButtonStyle.blurple, discord.Colour.blurple()),
-    "Trading": (discord.ButtonStyle.blurple, discord.Colour.blurple()),
-    "Transport": (discord.ButtonStyle.blurple, discord.Colour.blurple()),
-}
 
-ASK_MSG = '## Hi {member}! "{guild_name}" seems to be missing some information about you - let me help you with that!\n- Please update your linked RSI profile by typing `{prefix}profile username`\n - Use your exact `username` (case insensitive) from https://robertsspaceindustries.com'
-MESSAGE_TIMEOUT = 5 * 60
-TYPE_BLACKLIST = ["Star", "Lagrange", "JumpPoint", "Lagrange Point", "Naval Station"]
-INTERNAL_NAME_BLACKLIST = ["-L5-", "-L4-", "ARC-L3-A"]
-SYSTEM = "Stanton"
-DEFAULT_OM_RADIUS = 20_000
-LOCATIONS = [
-    l
-    for l in json.load(open("locations.json"))
-    if l["Type"] not in TYPE_BLACKLIST
-    and not any(i for i in INTERNAL_NAME_BLACKLIST if i in l["InternalName"])
-    and l["System"] == SYSTEM
-]
-LOCATION_TYPES = list(set([l["Type"] for l in LOCATIONS]))
-# SENTENCE_TRANSFORMER = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+class LetInButton(discord.ui.Button):
+    def __init__(self, member_id: int, label: str, style: discord.ButtonStyle):
+        self.member_id = member_id
+        super().__init__(label=label, style=style)
 
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if isinstance(interaction.guild, discord.Guild):
+            member = interaction.guild.get_member(self.member_id)
+            startrole = CONFIG_COLLECTION.find_one({"_id": "startrole"})
+            if startrole and member:
+                role = interaction.guild.get_role(startrole["role"])
+                if role:
+                    await member.add_roles(role)
 
-class ParsingException(Exception):
-    pass
+                    desired_nick = get_desired_nick(member)
+                    if desired_nick:
+                        await member.edit(nick=desired_nick)
 
-
-class Activity(pydantic.BaseModel):
-    name: str
-    url: str
-
-    def button_style(self) -> discord.ButtonStyle:
-        return (
-            ACTIVITY_LOOKUP[self.name][0]
-            if self.name in ACTIVITY_LOOKUP
-            else discord.ButtonStyle.blurple
-        )
-
-    def colour(self) -> discord.Colour:
-        return (
-            ACTIVITY_LOOKUP[self.name][1]
-            if self.name in ACTIVITY_LOOKUP
-            else discord.Colour.blurple()
-        )
-
-
-class OrganisationTag(pydantic.BaseModel):
-    name: str
-    value: str
-
-
-class Rank(pydantic.BaseModel):
-    rank: int
-    name: str
-
-
-class Organisation(pydantic.BaseModel):
-    name: str
-    body: str
-    history: str
-    tags: list[OrganisationTag]
-    sid: str
-    rank: Rank | None
-    icon_url: str
-    url: str
-    primary_activity: Activity
-    secondary_activity: Activity
-
-
-class MinOrganisation(pydantic.BaseModel):
-    name: str
-    icon_url: str
-
-
-class Badge(pydantic.BaseModel):
-    name: str
-    icon_url: str
-
-
-class Profile(pydantic.BaseModel):
-    handle: str
-    bio: str
-    badge: Badge
-    image_url: str
-    citizen_record_id: str
-    main_org: Organisation | MinOrganisation | None
-    enlisted: datetime.datetime
-    location: str | None
-    fluency: str | None
-
-
-class DiscordMarkdownConverter(markdownify.MarkdownConverter):
-    def convert_a(self, el: Tag, text: str, convert_as_inline: bool) -> str:
-        return text
-
-    def convert_hn(self, n: int, el: Tag, text: str, convert_as_inline: bool) -> str:
-        if n > 3:
-            return f"**{text}**"
-        return str(super().convert_hn(n, el, text, convert_as_inline))
+                    await interaction.response.edit_message(
+                        content=f"## {interaction.user.mention} let {member.mention} in, giving them the starting role {role.mention}",
+                        view=None,
+                    )
+            elif not startrole:
+                await interaction.response.edit_message(
+                    content=f"## ERROR: missing start role, please set it with `{PREFIX}startrole`",
+                )
+            else:
+                await interaction.response.edit_message(
+                    content=f'## ERROR: could not find member with id "{self.member_id}" in {interaction.guild.name}',
+                )
+        else:
+            logger.warning(
+                f"LetInButton instantiazed outside Guild: {self.member_id} | {interaction}"
+            )
 
 
 def location_to_str(location: dict) -> str:
@@ -197,385 +106,6 @@ async def check_guild(interaction: discord.Interaction) -> bool:
         )
         return False
     return True
-
-
-def find_or_except(
-    soup: BeautifulSoup | Tag, key: str | None, value: str, desc: str
-) -> Tag:
-    if key:
-        res = soup.find(attrs={key: value})
-    else:
-        res = soup.find(value)
-    if not isinstance(res, Tag):
-        raise ParsingException(
-            f'Could not find {key if key else ""} "{value}" on "{desc}"'
-        )
-    return res
-
-
-def find_child_or_except(
-    soup: BeautifulSoup | Tag,
-    value: str,
-    index: int,
-    desc: str,
-    recursive: bool = False,
-) -> Tag:
-    res = soup.findChildren(value, recursive=recursive)
-    if len(res) < index + 1:
-        raise ParsingException(
-            f'Expected at least {index+1} children on "{value}" on "{desc}" but found {len(res)}'
-        )
-    res_i = res[index]
-    if not isinstance(res_i, Tag):
-        raise ParsingException(f'Could not find child {index} on "{value}" on "{desc}"')
-    return res_i
-
-
-def key_or_except(
-    soup: BeautifulSoup | Tag,
-    err: str,
-    key: str = "src",
-    link: bool = True,
-    join: str = "",
-) -> str:
-    value = soup[key]
-    if isinstance(value, list):
-        value = join.join(value)
-    if not isinstance(value, str):
-        raise ParsingException(f'Could not get "{key}" on "{err}"')
-    if link and not value.startswith("http"):
-        value = "https://robertsspaceindustries.com" + value
-    return value
-
-
-def extract_thumbnail_src(tag: Tag, err: str) -> str:
-    thumb_tag = find_or_except(tag, "class", "thumb", err)
-    image = find_child_or_except(thumb_tag, "img", 0, "thumb")["src"]
-    if not isinstance(image, str):
-        raise ParsingException(f'Could not get src from "thumb" img in "{err}"')
-    if not image.startswith("http"):
-        image = "https://robertsspaceindustries.com" + image
-    return image
-
-
-def soup_to_discord_markdown(soup: Tag) -> str:
-    md = str(DiscordMarkdownConverter().convert_soup(soup))
-    while "\n\n\n" in md:
-        md = md.replace("\n\n\n", "\n\n")
-    while ("-" * 69) in md:
-        md = md.replace("-" * 69, "-" * 68)
-    while ("_" * 69) in md:
-        md = md.replace("_" * 69, "_" * 68)
-    while ("\_" * 69) in md:
-        md = md.replace("\_" * 69, "\_" * 68)
-
-    return md.strip()
-
-
-def url_to_org(url: str, rank: Rank | None) -> Organisation | None:
-    r = httpx.get(url)
-    if not r.is_success:
-        return None
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    img = find_or_except(
-        find_or_except(soup, "class", "logo", url), None, "img", f"logo {url}"
-    )
-
-    body = soup_to_discord_markdown(find_or_except(soup, "class", "body", url))
-
-    history = soup_to_discord_markdown(
-        find_child_or_except(
-            find_or_except(soup, "id", "tab-history", url), "div", 0, url
-        )
-    )
-
-    tags = [
-        OrganisationTag(
-            name=key_or_except(c, f"li {url}", key="class", link=False).capitalize(),
-            value=c.text.strip(),
-        )
-        for c in find_or_except(soup, "class", "tags", url).find_all("li")
-    ]
-    primary_activity_tag = find_or_except(
-        find_or_except(soup, "class", "primary", url), None, "img", f"primary {url}"
-    )
-    primary_activity_name = key_or_except(
-        primary_activity_tag, f"img primary {url}", key="alt", link=False
-    )
-    primary_activity = Activity(
-        name=primary_activity_name,
-        url=key_or_except(primary_activity_tag, f"img primary {url}"),
-    )
-    secondary_activity_tag = find_or_except(
-        find_or_except(soup, "class", "secondary", url), None, "img", f"secondary {url}"
-    )
-    secondary_activity_name = key_or_except(
-        secondary_activity_tag, f"img secondary {url}", key="alt", link=False
-    )
-    secondary_activity = Activity(
-        name=secondary_activity_name,
-        url=key_or_except(secondary_activity_tag, f"img secondary {url}"),
-    )
-
-    h1 = find_or_except(soup, None, "h1", f"h1 {url}")
-
-    return Organisation(
-        name=h1.text.rsplit("/", 1)[0].strip(),
-        body=body,
-        history=history,
-        tags=tags,
-        sid=find_child_or_except(h1, "span", 0, f"span h1 {url}").text.strip(),
-        rank=rank,
-        icon_url=key_or_except(img, f"img {url}"),
-        url=url,
-        primary_activity=primary_activity,
-        secondary_activity=secondary_activity,
-    )
-
-
-def extract_org_info(org_tag: Tag, err: str) -> Organisation | MinOrganisation | None:
-    try:
-        thumb = find_or_except(org_tag, "class", "thumb", err)
-    except ParsingException:
-        return None
-
-    try:
-        url = key_or_except(
-            find_or_except(thumb, None, "a", f"thumb {err}"),
-            f"a thumb {err}",
-            key="href",
-        )
-    except ParsingException:
-        return MinOrganisation(
-            name="[REDACTED]",
-            icon_url=key_or_except(
-                find_or_except(thumb, None, "img", f"img thumb {err}"),
-                f"img thumb {err}",
-            ),
-        )
-
-    info = find_or_except(org_tag, "class", "info", err)
-    ranking = find_or_except(org_tag, "class", "ranking", f"info {err}")
-    return url_to_org(
-        url,
-        Rank(
-            rank=len(ranking.findChildren(attrs={"class": "active"}, recursive=False)),
-            name=find_child_or_except(
-                info, "strong", 1, f"info {err}", recursive=True
-            ).text.strip(),
-        ),
-    )
-
-
-DESC_TOO_LONG = "...\n\n`[DESCRIPTION TOO LONG]`\n"
-DESC_MAX_LEN = 4096 - len(DESC_TOO_LONG)
-
-
-def org_to_embed(org: Organisation) -> discord.Embed:
-    description = f"{org.body}\n# History:\n{org.history}"
-    if len(description) > DESC_MAX_LEN:
-        description = description[:DESC_MAX_LEN] + DESC_TOO_LONG
-
-    org_embed = discord.Embed(
-        title=org.name,
-        url=org.url,
-        colour=org.primary_activity.colour(),
-        description=description,
-    )
-    org_embed.set_author(
-        name=f"Primary activity: {org.primary_activity.name}",
-        icon_url=org.primary_activity.url,
-    )
-    org_embed.set_image(url=org.icon_url)
-    org_embed.add_field(name="SID", value=org.sid)
-    for t in org.tags:
-        org_embed.add_field(name=t.name, value=t.value)
-    if org.rank:
-        org_embed.add_field(
-            name="Member Rank", value=f"{org.rank.name} ({org.rank.rank}/5)"
-        )
-    org_embed.set_footer(
-        text=f"Secondary activity: {org.secondary_activity.name}",
-        icon_url=org.secondary_activity.url,
-    )
-    return org_embed
-
-
-class DisplayOrgButton(discord.ui.Button):
-    def __init__(self, org: Organisation, label: str, style: discord.ButtonStyle):
-        self.org = org
-        super().__init__(label=label, style=style)
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if isinstance(interaction.channel, discord.TextChannel):
-            await interaction.response.send_message(
-                delete_after=MESSAGE_TIMEOUT,
-                embed=org_to_embed(self.org),
-                ephemeral=True,
-            )
-
-
-def orgs_lookup(url: str) -> int | list[Organisation] | MinOrganisation:
-    r = httpx.get(url + "/organizations")
-
-    if not r.is_success:
-        return r.status_code
-
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    main_org_tag = find_or_except(soup, "class", "main", "page")
-    left_col_tag = find_or_except(main_org_tag, "class", "left-col", "main org")
-
-    main_org = extract_org_info(left_col_tag, "main org")
-    try:
-        affiliation_orgs = [
-            extract_org_info(c, "main org")
-            for c in find_or_except(soup, "class", "affiliation", "page").children
-            if isinstance(c, Tag)
-        ]
-    except ParsingException as e:
-        affiliation_orgs = []
-
-    if isinstance(main_org, MinOrganisation):
-        return main_org
-    else:
-        return [o for o in [main_org] + affiliation_orgs if isinstance(o, Organisation)]
-
-
-def profile_to_embed(profile: Profile) -> discord.Embed:
-    embed = discord.Embed(
-        title=profile.handle,
-        url=RSI_BASE_URL + urllib.parse.quote(profile.handle),
-        description=profile.bio,
-        timestamp=profile.enlisted,
-    )
-
-    embed.set_footer(
-        text=f"{profile.badge.name} │ Enlisted", icon_url=profile.badge.icon_url
-    )
-
-    embed.set_image(url=profile.image_url)
-    if profile.citizen_record_id != "n/a":
-        embed.add_field(name=f"UEE Citizen Record", value=profile.citizen_record_id)
-
-    if profile.location:
-        embed.add_field(name="Location", value=profile.location)
-
-    if profile.fluency:
-        embed.add_field(name="Fluency", value=profile.fluency)
-
-    if profile.main_org:
-        if isinstance(profile.main_org, Organisation):
-            embed.colour = profile.main_org.primary_activity.colour()
-            embed.set_thumbnail(url=profile.main_org.primary_activity.url)
-            embed.add_field(
-                name="Primary activity", value=profile.main_org.primary_activity.name
-            )
-            embed.add_field(
-                name="Secondary activity",
-                value=profile.main_org.secondary_activity.name,
-            )
-
-        embed.set_author(
-            name=f"Main Org: {profile.main_org.name}",
-            url=profile.main_org.url
-            if isinstance(profile.main_org, Organisation)
-            else None,
-            icon_url=profile.main_org.icon_url,
-        )
-
-    return embed
-
-
-def extract_profile_info(url: str) -> int | Profile:
-    r = httpx.get(url)
-
-    if not r.is_success:
-        return r.status_code
-
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    public_profile = find_or_except(soup, "id", "public-profile", "page")
-
-    # Extract user "Handle name"
-    info_tag = find_or_except(public_profile, "class", "info", "public-profile")
-    handle_parent_tag = find_child_or_except(info_tag, "p", 1, "info")
-    handle = find_or_except(
-        handle_parent_tag, None, "strong", "handle parent"
-    ).text.strip()
-
-    # Extract user badge
-    badge_parent_tag = find_child_or_except(info_tag, "p", 2, "info")
-    badge_icon_url = key_or_except(
-        find_or_except(badge_parent_tag, None, "img", "info badge img"),
-        "info badge img",
-    )
-    badge_text = find_child_or_except(
-        badge_parent_tag, "span", 1, "info badge text"
-    ).text.strip()
-
-    # Extract profile image
-    image_url = extract_thumbnail_src(public_profile, "public-profile")
-
-    # Extract "UEE Citizen Record" id
-    citizen_record_id = find_child_or_except(
-        find_or_except(public_profile, "class", "citizen-record", "public-profile"),
-        "strong",
-        0,
-        "citizen-record",
-    ).text.strip()
-
-    # Extract main org
-    main_org = extract_org_info(
-        find_or_except(public_profile, "class", "main-org", "public-profile"),
-        "main-org",
-    )
-
-    # Extract bio
-    bio_tag = public_profile.find(attrs={"class": "bio"})
-    bio = ""
-    if isinstance(bio_tag, Tag):
-        bio_body_tag = bio_tag.find("div")
-        if isinstance(bio_body_tag, Tag):
-            bio = bio_body_tag.text.strip()
-
-    # Extract enlisted, localtion, fluency
-    left_col = public_profile.find_all(attrs={"class": "left-col"})[-1]
-    enlisted = datetime.datetime.now()
-    location = None
-    fluency = None
-    for i, entry in enumerate(left_col.find_all(attrs={"class": "entry"})):
-        label = find_or_except(
-            entry, "class", "label", f"entry-{i} left-col public-profile"
-        ).text.strip()
-        value = (
-            find_or_except(
-                entry, "class", "value", f"entry-{i} left-col public-profile"
-            )
-            .text.replace("\n", "")
-            .strip()
-        )
-        while " ," in value:
-            value = value.replace(" ,", ",")
-        if label == "Enlisted":
-            enlisted = datetime.datetime.strptime(value, "%b %d, %Y")
-        elif label == "Location":
-            location = value
-        elif label == "Fluency":
-            fluency = value
-
-    return Profile(
-        handle=handle,
-        bio=bio,
-        badge=Badge(name=badge_text, icon_url=badge_icon_url),
-        image_url=image_url,
-        citizen_record_id=citizen_record_id,
-        main_org=main_org,
-        enlisted=enlisted,
-        location=location,
-        fluency=fluency,
-    )
 
 
 def get_members_without_rsi_profiles(guild: discord.Guild) -> list[discord.Member]:
@@ -617,9 +147,11 @@ def get_desired_nick(
 
     db_user = USERS_COLLECTION.find_one({"_id": member.id})
     if db_user:
-        return f'{get_role_icon(member, sorted_db_roles)} {db_user["nick"]} {get_role_icon(member, db_wings)}'.strip()
+        middle = db_user["nick"]
     else:
-        return None
+        middle = member.name
+
+    return f"{get_role_icon(member, sorted_db_roles)} {middle} {get_role_icon(member, db_wings)}".strip()
 
 
 def get_wrong_nicks(guild: discord.Guild) -> list[tuple]:
@@ -635,226 +167,16 @@ def get_wrong_nicks(guild: discord.Guild) -> list[tuple]:
     return wrong_nicks
 
 
-# def search(
-#     collection: list, search_str: str, to_str: typing.Callable[[typing.Any], str]
-# ) -> typing.Any:
-#     search_str_embedding = SENTENCE_TRANSFORMER.encode(
-#         search_str, convert_to_tensor=True
-#     )
-
-#     closest = 0
-#     for m in collection:
-#         if (
-#             similarity := util.pytorch_cos_sim(
-#                 SENTENCE_TRANSFORMER.encode(to_str(m), convert_to_tensor=True),
-#                 search_str_embedding,
-#             )
-#         ) > closest:
-#             closest = similarity
-#             document = m
-
-#     return document
-
-
-def point_point_dist(
-    a: numpy.typing.NDArray, b: numpy.typing.NDArray
-) -> numpy.floating:
-    return numpy.linalg.norm(a - b)
-
-
-def line_point_dist(
-    line: tuple[numpy.typing.NDArray, numpy.typing.NDArray], point: numpy.typing.NDArray
-) -> numpy.floating:
-    p1, p2 = line
-    return numpy.linalg.norm(numpy.cross(p2 - p1, p1 - point)) / numpy.linalg.norm(
-        p2 - p1
-    )
-
-
-def closest_point(
-    line: tuple[numpy.typing.NDArray, numpy.typing.NDArray], point: numpy.typing.NDArray
-) -> numpy.typing.NDArray:
-    p1, p2 = line
-    x1, y1, z1 = p1
-    x2, y2, z2 = p2
-    x3, y3, z3 = point
-    dx, dy, dz = x2 - x1, y2 - y1, z2 - z1
-    det = dx * dx + dy * dy + dz * dz
-    a = (dx * (x3 - x1) + dy * (y3 - y1) + dz * (z3 - z1)) / det
-    return numpy.array([x1 + a * dx, y1 + a * dy, z1 + a * dz])
-
-
-def perpendicular_unit_vector(v: numpy.typing.NDArray) -> numpy.typing.NDArray:
-    if v[0] == 0 and v[1] == 0:
-        if v[2] == 0:
-            # v is Vector(0, 0, 0)
-            raise ValueError("zero vector")
-
-        # v is Vector(0, 0, v.z)
-        return numpy.array([0, 1, 0])
-
-    res_v = numpy.array([-v[1], v[0], 0])
-    return numpy.array(res_v / numpy.linalg.norm(res_v))
-
-
-def pretty_print_dist(number: float | numpy.floating) -> str:
-    if number > 1_000:
-        return f"{number/1000:,.1f} km"
-
-    return f"{number:,.1f} m"
-
-
-def is_left_of(
-    line: tuple[numpy.typing.NDArray, numpy.typing.NDArray], point: numpy.typing.NDArray
-) -> bool:
-    aX = line[0][0]
-    aY = line[0][1]
-    bX = line[1][0]
-    bY = line[1][1]
-    cX = point[0]
-    cY = point[1]
-
-    val = (bX - aX) * (cY - aY) - (bY - aY) * (cX - aX)
-    if val >= 0:
-        return True
-    else:
-        return False
-
-
-class SnareCheckModal(discord.ui.Modal):
-    def __init__(
-        self,
-        centerline: tuple[numpy.typing.NDArray, numpy.typing.NDArray],
-        hypotenuse: tuple[numpy.typing.NDArray, numpy.typing.NDArray],
-        physics_range: float,
-        optimal_range: float,
-        title: str,
-    ) -> None:
-        self.centerline = centerline
-        self.hypotenuse = hypotenuse
-        self.physics_range = physics_range
-        self.optimal_range = optimal_range
-        super().__init__(title=title)
-
-        self.add_item(
-            discord.ui.TextInput(label='Please paste the output of "/showlocation"')
-        )
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        assert isinstance(self.children[0], discord.ui.TextInput)
-        try:
-            location = numpy.array(
-                [float(l.split(":")[-1]) for l in self.children[0].value.split()[1:]]
-            )
-            destination_dist = point_point_dist(location, self.centerline[1])
-            if destination_dist < self.physics_range:
-                await interaction.response.send_message(
-                    "# ❌ WITHIN PHYSICS GRID!\nPlease reset and try again",
-                    ephemeral=True,
-                    delete_after=MESSAGE_TIMEOUT,
-                )
-                return
-
-            centerline_dist = line_point_dist(self.centerline, location)
-            max_dist = 20_000 - line_point_dist(
-                self.hypotenuse, closest_point(self.centerline, location)
-            )
-
-            if centerline_dist <= max_dist:
-                colour = discord.Colour.green()
-                description = "# ✅ Within snare cone!"
-            else:
-                colour = discord.Colour.red()
-                description = f"# ❌ {pretty_print_dist(centerline_dist- max_dist)} outside snare cone!"
-
-            closest_centerline_point = closest_point(self.centerline, location)
-            z_mag = abs(closest_centerline_point[2] - location[2])
-            z_dir = "up" if closest_centerline_point[2] > 0 else "down"
-            s_mag = numpy.linalg.norm((closest_centerline_point - location)[:2])
-            s_dir = "right" if is_left_of(self.centerline, location) else "left"
-            f_mag = (
-                point_point_dist(closest_centerline_point, self.centerline[1])
-                - self.optimal_range
-            )
-            f_dir = "forward" if f_mag > 0 else "backwards"
-
-            description += (
-                "\n## Route to centerline:\nFacing your destination and rotated so up for your ship is Stanton north:"
-                + (
-                    f"\n- Travel {pretty_print_dist(abs(z_mag))} {z_dir}"
-                    if abs(z_mag) > 1
-                    else ""
-                )
-                + (
-                    f"\n- Travel {pretty_print_dist(abs(s_mag))} {s_dir}"
-                    if abs(s_mag) > 1
-                    else ""
-                )
-                + (
-                    f"\n### Final travel to optimal pullout:\n- Travel {pretty_print_dist(abs(f_mag))} {f_dir}"
-                    if abs(f_mag) > 1
-                    else ""
-                )
-            )
-
-            closest_edge = min(
-                20_000 - line_point_dist(self.hypotenuse, location),
-                destination_dist - self.physics_range,
-            )
-            location_score = (
-                closest_edge / (self.optimal_range - self.physics_range) * 10
-            )
-
-            embed = discord.Embed(
-                title="Snare check", description=description, colour=colour
-            )
-            embed.add_field(
-                name="Distance to centerline",
-                value=pretty_print_dist(centerline_dist),
-            )
-            embed.add_field(
-                name="Distance to Physics Grid",
-                value=pretty_print_dist(destination_dist - self.physics_range),
-            )
-            embed.add_field(name="Location score", value=f"{location_score:.1f}/10")
-            await interaction.response.send_message(
-                embed=embed, ephemeral=True, delete_after=MESSAGE_TIMEOUT
-            )
-        except Exception as e:
-            logger.error(e)
-            await interaction.response.send_message(
-                'Something went wrong while parsing your coordinates - make sure you paste the exact output of the "/showlocation" command',
-                ephemeral=True,
-                delete_after=MESSAGE_TIMEOUT,
-            )
-
-
-class SnareCheckButton(discord.ui.Button):
-    def __init__(
-        self,
-        centerline: tuple[numpy.typing.NDArray, numpy.typing.NDArray],
-        hypotenuse: tuple[numpy.typing.NDArray, numpy.typing.NDArray],
-        physics_range: float,
-        optimal_range: float,
-        label: str,
-        style: discord.ButtonStyle,
-    ):
-        self.centerline = centerline
-        self.hypotenuse = hypotenuse
-        self.physics_range = physics_range
-        self.optimal_range = optimal_range
-        super().__init__(label=label, style=style)
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_modal(
-            SnareCheckModal(
-                self.centerline,
-                self.hypotenuse,
-                self.physics_range,
-                self.optimal_range,
-                "Check your location",
-            )
-        )
+def get_feedback_admins(
+    collection: pymongo.collection.Collection, guild: discord.Guild
+) -> typing.Generator[discord.Member, None, None]:
+    fba = collection.find_one({"_id": "feedbackadminrole"})
+    if not isinstance(fba, dict) or "value" not in fba:
+        return
+    for member in guild.members:
+        for role in member.roles:
+            if role.id == fba["value"]:
+                yield member
 
 
 # ======== PUBLIC COMMANDS ========
@@ -1010,13 +332,13 @@ async def snare(
 
 @tree.command(name="profile", description=PROFILE_DESCRIPTION)
 async def profile(interaction: discord.Interaction, username: str) -> None:
+    await interaction.response.defer(thinking=True)
     url = RSI_BASE_URL + username
     try:
         profile = extract_profile_info(url)
     except ParsingException as e:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"An error happened, please contact an admin and send them the following: {url} | {e}",
-            delete_after=MESSAGE_TIMEOUT,
         )
 
     if isinstance(profile, Profile):
@@ -1038,15 +360,13 @@ async def profile(interaction: discord.Interaction, username: str) -> None:
                     f'Cannot change nickname for "{interaction.user.mention}": {e}'
                 )
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Updated linked RSI profile for user {interaction.user.mention} ✅\nRemember you can always update your profile with `{PREFIX}profile username`",
             embed=profile_to_embed(profile),
-            delete_after=MESSAGE_TIMEOUT,
         )
     else:
-        await interaction.response.send_message(
-            f'Could not find "{username}", please type your exact username (case insensitive) from https://robertsspaceindustries.com',
-            delete_after=MESSAGE_TIMEOUT,
+        await interaction.followup.send(
+            f'Could not find "{username}", please type your exact username (case insensitive) from https://robertsspaceindustries.com'
         )
 
 
@@ -1055,8 +375,10 @@ async def profile(interaction: discord.Interaction, username: str) -> None:
     description=WHOIS_DESCRIPTION,
 )
 async def whois(interaction: discord.Interaction, member: discord.Member) -> None:
+    await interaction.response.defer(thinking=True)
+
     if member == client.user:
-        await interaction.response.send_message(embed=get_bot_embed())
+        await interaction.followup.send(embed=get_bot_embed())
         return
 
     db_user = USERS_COLLECTION.find_one({"_id": member.id})
@@ -1080,31 +402,25 @@ async def whois(interaction: discord.Interaction, member: discord.Member) -> Non
                         )
                     )
             elif isinstance(organisations, int):
-                await interaction.response.send_message(
-                    f'User {member.mention} has invalid URL ({db_user["url"]}) please update immediately via `{PREFIX}profile username`',
-                    delete_after=MESSAGE_TIMEOUT,
+                await interaction.followup.send(
+                    f'User {member.mention} has invalid URL ({db_user["url"]}) please update immediately via `{PREFIX}profile username`'
                 )
         except ParsingException as e:
-            await interaction.response.send_message(
-                f"An error happened, please contact an admin and send them the following: {db_user['url']} | {e}",
-                delete_after=MESSAGE_TIMEOUT,
+            await interaction.followup.send(
+                f"An error happened, please contact an admin and send them the following: {db_user['url']} | {e}"
             )
             return
 
         if isinstance(profile, Profile):
-            await interaction.response.send_message(
-                embed=profile_to_embed(profile), view=view, delete_after=MESSAGE_TIMEOUT
-            )
+            await interaction.followup.send(embed=profile_to_embed(profile), view=view)
             return
         else:
-            await interaction.response.send_message(
-                f'User {member.mention} has invalid URL ({db_user["url"]}) please update immediately via `{PREFIX}profile username`',
-                delete_after=MESSAGE_TIMEOUT,
+            await interaction.followup.send(
+                f'User {member.mention} has invalid URL ({db_user["url"]}) please update immediately via `{PREFIX}profile username`'
             )
     else:
-        await interaction.response.send_message(
-            f"{member.mention} has not yet linked their RSI profile, please do so via `{PREFIX}profile username`",
-            delete_after=MESSAGE_TIMEOUT,
+        await interaction.followup.send(
+            f"{member.mention} has not yet linked their RSI profile, please do so via `{PREFIX}profile username`"
         )
 
 
@@ -1113,6 +429,8 @@ async def whois(interaction: discord.Interaction, member: discord.Member) -> Non
     description=LOOKUP_DESCRIPTION,
 )
 async def lookup(interaction: discord.Interaction, username: str) -> None:
+    await interaction.response.defer(thinking=True)
+
     url = RSI_BASE_URL + username
     view = discord.ui.View()
     try:
@@ -1132,20 +450,15 @@ async def lookup(interaction: discord.Interaction, username: str) -> None:
                     )
                 )
     except ParsingException as e:
-        await interaction.response.send_message(
-            f"An error happened, please contact an admin and send them the following: {url} | {e}",
-            delete_after=MESSAGE_TIMEOUT,
+        await interaction.followup.send(
+            f"An error happened, please contact an admin and send them the following: {url} | {e}"
         )
         return
 
     if isinstance(profile, Profile):
-        await interaction.response.send_message(
-            embed=profile_to_embed(profile), view=view, delete_after=MESSAGE_TIMEOUT
-        )
+        await interaction.followup.send(embed=profile_to_embed(profile), view=view)
     else:
-        await interaction.response.send_message(
-            f'No profile found on "{url}"', delete_after=MESSAGE_TIMEOUT
-        )
+        await interaction.followup.send(f'No profile found on "{url}"')
 
 
 def get_bot_embed() -> discord.Embed:
@@ -1181,17 +494,189 @@ async def bot_help(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=get_bot_embed())
 
 
-def normalize_string(input_string: str) -> str:
-    return "".join(
-        c for c in input_string if c in string.ascii_letters + string.whitespace
-    ).strip()
+class Vote(enum.Enum):
+    Nay = 0
+    Yay = 1
+
+
+@tree.command(
+    name="feedback",
+    description="Give/update feedback on another member",
+)
+async def feedback(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    feedback: str | None,
+    vote: Vote | None,
+) -> None:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "Feedback only available inside Discord guild (server)",
+            ephemeral=True,
+            delete_after=MESSAGE_TIMEOUT,
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    GUILD_DB = mongodb_client[str(interaction.guild.id)]
+    COLLECTION = GUILD_DB[f"feedback-{interaction.user.id}"]
+
+    initial = COLLECTION.find_one({"_id": member.id}) or {}
+    new = {**initial}
+    if feedback is not None:
+        new["feedback"] = feedback
+    if vote is not None:
+        new["vote"] = vote.value
+
+    try:
+        COLLECTION.insert_one({"_id": member.id, **new})
+    except pymongo.errors.DuplicateKeyError:
+        COLLECTION.replace_one({"_id": member.id}, new)
+
+    if initial != new:
+        for admin in get_feedback_admins(GUILD_DB["config"], interaction.guild):
+            embed = discord.Embed(title="Feedback updated")
+            embed.add_field(name="Giver", value=f"<@{interaction.user.id}>")
+            embed.add_field(name="Reciever", value=f"<@{member.id}>")
+            await admin.send(embed=embed)
+
+    await interaction.followup.send(
+        embed=discord.Embed(
+            description=f"# {member.mention}"
+            + (f" - Vote: {Vote(new['vote']).name}" if new["vote"] != None else "")
+            + (f'\n{new["feedback"]}' if new["feedback"] != None else ""),
+        ),
+        ephemeral=True,
+    )
+
+
+@tree.command(
+    name="myfeedback",
+    description="List all feedback given on other members",
+)
+async def myfeedback(
+    interaction: discord.Interaction, member: discord.Member | None
+) -> None:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "Feedback only available inside Discord guild (server)",
+            ephemeral=True,
+            delete_after=MESSAGE_TIMEOUT,
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    GUILD_DB = mongodb_client[str(interaction.guild.id)]
+    COLLECTION = GUILD_DB[f"feedback-{interaction.user.id}"]
+
+    await interaction.followup.send(
+        embed=discord.Embed(
+            description="\n".join(
+                f"# <@{m['_id']}>"
+                + (f" - Vote: {Vote(m['vote']).name}" if m["vote"] != None else "")
+                + (f'\n{m["feedback"]}' if m["feedback"] != None else "")
+                for m in COLLECTION.find()
+                if not member or member.id == m["_id"]
+            ),
+        ),
+        ephemeral=True,
+    )
 
 
 # ======== ADMIN COMMANDS ========
 CURRENT_OPS = {}
-AUDIO_DIR = pathlib.Path("audio")
-AUDIO_DIR.mkdir(exist_ok=True)
-CHUNK_SIZE = 1024
+
+
+@tree.command(
+    name="allfeedback",
+    description="List all feedback given to a specific member",
+)
+async def allfeedback(interaction: discord.Interaction, member: discord.Member) -> None:
+    if not interaction.guild:
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    GUILD_DB = mongodb_client[str(interaction.guild.id)]
+
+    description = ""
+    for collection_name in GUILD_DB.list_collection_names():
+        if "feedback-" in collection_name and (
+            f := GUILD_DB[collection_name].find_one({"_id": member.id})
+        ):
+            member_id = collection_name.split("-")[-1]
+            description += (
+                f"\n# <@{member_id}>"
+                + (f" - Vote: {Vote(f['vote']).name}" if f["vote"] != None else "")
+                + (f'\n{f["feedback"]}' if f["feedback"] != None else "")
+            )
+
+    await interaction.followup.send(
+        embed=discord.Embed(description=description), ephemeral=True
+    )
+
+
+@tree.command(
+    name="feedbackadmin",
+    description="Set feedback admin role",
+)
+async def feedbackadmin(interaction: discord.Interaction, role: discord.Role) -> None:
+    if not interaction.guild or not await check_admin(interaction):
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    GUILD_DB = mongodb_client[str(interaction.guild.id)]
+    COLLECTION = GUILD_DB["config"]
+    try:
+        COLLECTION.insert_one({"_id": "feedbackadminrole", "value": role.id})
+    except pymongo.errors.DuplicateKeyError:
+        COLLECTION.replace_one({"_id": "feedbackadminrole"}, {"value": role.id})
+
+    await interaction.followup.send(
+        embed=discord.Embed(
+            title="Feedback admins",
+            description="\n".join(
+                f"- {a.mention}"
+                for a in get_feedback_admins(COLLECTION, interaction.guild)
+            ),
+        ),
+        ephemeral=True,
+    )
+
+
+# @tree.command(
+#     name="funny",
+# )
+# async def funny(
+#     interaction: discord.Interaction,
+#     message_id: str,
+#     response: str,
+# ) -> None:
+#     if not interaction.guild or not await check_admin(interaction):
+#         return
+#     message_id_int = int(message_id)
+
+#     message = None
+#     for channel in interaction.guild.channels:
+#         if isinstance(channel, discord.TextChannel):
+#             try:
+#                 message = await channel.fetch_message(message_id_int)
+#                 await message.reply(response)
+#                 await interaction.response.send_message(
+#                     "Funny done!", delete_after=MESSAGE_TIMEOUT, ephemeral=True
+#                 )
+#                 return
+#             except discord.errors.NotFound:
+#                 ...
+
+#     await interaction.followup.send_message(
+#         f'Could not find message "{message_id_int}"',
+#         delete_after=MESSAGE_TIMEOUT,
+#         ephemeral=True,
+#     )
 
 
 @tree.command(
@@ -1558,10 +1043,17 @@ async def listroles(interaction: discord.Interaction) -> None:
     description="List all wings used during user renaming",
 )
 async def listwings(interaction: discord.Interaction) -> None:
-    if not await check_admin(interaction):
+    if not await check_admin(interaction) or not interaction.guild:
         return
 
-    wings: list[dict] = list(WINGS_COLLECTION.find())
+    wings: list[dict] = []
+    role_ids = [w.id for w in interaction.guild.roles]
+    for wing in WINGS_COLLECTION.find():
+        if wing["_id"] not in role_ids:
+            WINGS_COLLECTION.delete_one(wing)
+        else:
+            wings.append(wing)
+
     if not wings:
         await interaction.response.send_message(
             "No wings added yet", delete_after=MESSAGE_TIMEOUT
@@ -1572,97 +1064,6 @@ async def listwings(interaction: discord.Interaction) -> None:
         "Wings:\n" + "\n".join(f'{wing["icon"]} - <@&{wing["_id"]}>' for wing in wings),
         delete_after=MESSAGE_TIMEOUT,
     )
-
-
-class UpdateAllButton(discord.ui.Button):
-    def __init__(
-        self,
-        wrong_nicks: list[tuple[discord.Member, str]],
-        label: str,
-        style: discord.ButtonStyle,
-    ):
-        self.wrong_nicks = wrong_nicks
-        super().__init__(label=label, style=style)
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        assert isinstance(interaction.guild, discord.Guild)
-
-        await interaction.response.send_message(
-            f"Updating nicknames for {len(self.wrong_nicks)} members...",
-            ephemeral=True,
-            delete_after=MESSAGE_TIMEOUT,
-        )
-        msg = await interaction.original_response()
-        skipped = 0
-        for i, (member, nick) in enumerate(self.wrong_nicks):
-            await msg.edit(content=f"Updated {i}/{len(self.wrong_nicks)} nicknames...")
-            try:
-                await member.edit(nick=nick)
-            except discord.errors.Forbidden as e:
-                logger.warning(f'Cannot change nickname for "{member}": {e}')
-                skipped += 1
-
-        if not skipped:
-            await msg.edit(content=f"✅ Updated all {len(self.wrong_nicks)} nicknames")
-        else:
-            await msg.edit(
-                content=f"❌ Updated {len(self.wrong_nicks) - skipped}/{len(self.wrong_nicks)} nicknames due to permission error - remember bots cannot change owner and admin nicknames on Discord (has to be done manually)"
-            )
-
-
-class AskAllButton(discord.ui.Button):
-    def __init__(
-        self,
-        missing_members: list[discord.Member],
-        label: str,
-        style: discord.ButtonStyle,
-    ):
-        self.missing_members = missing_members
-        super().__init__(label=label, style=style)
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        assert isinstance(interaction.guild, discord.Guild)
-        await interaction.response.send_message(
-            f"Asking {len(self.missing_members)} members...",
-            ephemeral=True,
-            delete_after=MESSAGE_TIMEOUT,
-        )
-
-        msg = await interaction.original_response()
-        for i, member in enumerate(self.missing_members):
-            await msg.edit(content=f"Asked {i}/{len(self.missing_members)} members...")
-            await member.send(
-                ASK_MSG.format(
-                    member=member.mention,
-                    guild_name=interaction.guild.name,
-                    prefix=PREFIX,
-                )
-            )
-
-        await msg.edit(
-            content=f"✅ Asked all {len(self.missing_members)} members with missing RSI profiles"
-        )
-
-
-class GenericShowEmbedButton(discord.ui.Button):
-    def __init__(
-        self,
-        embed: discord.Embed,
-        view: discord.ui.View,
-        label: str,
-        style: discord.ButtonStyle,
-    ):
-        self.input_embed = embed
-        self.input_view = view
-        super().__init__(label=label, style=style)
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(
-            delete_after=MESSAGE_TIMEOUT,
-            embed=self.input_embed,
-            view=self.input_view,
-            ephemeral=True,
-        )
 
 
 @tree.command(
@@ -1680,42 +1081,20 @@ async def status(interaction: discord.Interaction) -> None:
     view = discord.ui.View()
 
     missing_members = get_members_without_rsi_profiles(interaction.guild)
-    wrong_nicks = get_wrong_nicks(interaction.guild)
     total_members = len([m for m in interaction.guild.members if not m.bot])
 
-    description = f" {total_members - len(missing_members)}/{total_members} members has linked their RSI profiles"
+    description = f" {total_members - len(missing_members)}/{total_members} members have linked their RSI profiles"
 
     if not missing_members:
         description = f"✅{description}\n"
     else:
         description = f"❌{description}\n"
 
-        missing_members_view = discord.ui.View()
-        missing_members_view.add_item(
-            AskAllButton(
-                missing_members=missing_members,
-                label="Ask all members missing",
-                style=discord.ButtonStyle.red,
-            ),
-        )
-        view.add_item(
-            GenericShowEmbedButton(
-                discord.Embed(
-                    title="Members missing RSI profiles",
-                    description="\n".join(f"- {m.mention}" for m in missing_members)
-                    + f"\nUse `{PREFIX}ask` to ask a specific member to update/add their linked RSI profile\n\n",
-                ),
-                missing_members_view,
-                label="Show members missing RSI Profiles",
-                style=discord.ButtonStyle.red,
-            )
-        )
-
-    total_members -= len(missing_members)
+    wrong_nicks = get_wrong_nicks(interaction.guild)
     if not wrong_nicks:
-        description += f"✅ {total_members - len(wrong_nicks)}/{total_members} members with RSI profiles have correct nicknames"
+        description += f"✅ {total_members - len(wrong_nicks)}/{total_members} members have correct nicknames"
     else:
-        description += f"❌ {total_members - len(wrong_nicks)}/{total_members} members with RSI profiles have correct nicknames"
+        description += f"❌ {total_members - len(wrong_nicks)}/{total_members} members have correct nicknames"
 
         wrong_nicks_view = discord.ui.View()
         wrong_nicks_view.add_item(
@@ -1752,27 +1131,6 @@ async def status(interaction: discord.Interaction) -> None:
         description=description,
     )
     await interaction.followup.send(embed=embed, view=view)
-
-
-@tree.command(
-    name="ask",
-    description="One member of the Guild to update their linked RSI profile",
-)
-async def ask(interaction: discord.Interaction, member: discord.Member) -> None:
-    if not await check_admin(interaction):
-        return
-
-    assert interaction.guild
-
-    await member.send(
-        ASK_MSG.format(
-            member=member.mention, guild_name=interaction.guild.name, prefix=PREFIX
-        )
-    )
-    await interaction.response.send_message(
-        delete_after=MESSAGE_TIMEOUT,
-        content=f"✅ {member.mention} has been asked to update their linked RSI profile",
-    )
 
 
 @tree.command(
@@ -1909,71 +1267,26 @@ async def listtriggers(interaction: discord.Interaction) -> None:
 
 
 # ======== EVENTS ========
-class LetInButton(discord.ui.Button):
-    def __init__(self, member_id: int, label: str, style: discord.ButtonStyle):
-        self.member_id = member_id
-        super().__init__(label=label, style=style)
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if isinstance(interaction.guild, discord.Guild):
-            member = interaction.guild.get_member(self.member_id)
-            startrole = CONFIG_COLLECTION.find_one({"_id": "startrole"})
-            if startrole and member:
-                role = interaction.guild.get_role(startrole["role"])
-                if role:
-                    await member.add_roles(role)
-
-                    desired_nick = get_desired_nick(member)
-                    if desired_nick:
-                        await member.edit(nick=desired_nick)
-
-                    await interaction.response.edit_message(
-                        content=f"## {interaction.user.mention} let {member.mention} in, giving them the starting role {role.mention}",
-                        view=None,
-                    )
-            elif not startrole:
-                await interaction.response.edit_message(
-                    content=f"## ERROR: missing start role, please set it with `{PREFIX}startrole`",
-                )
-            else:
-                await interaction.response.edit_message(
-                    content=f'## ERROR: could not find member with id "{self.member_id}" in {interaction.guild.name}',
-                )
-        else:
-            logger.warning(
-                f"LetInButton instantiazed outside Guild: {self.member_id} | {interaction}"
-            )
-
-
-class KickButton(discord.ui.Button):
-    def __init__(self, member_id: int, label: str, style: discord.ButtonStyle):
-        self.member_id = member_id
-        super().__init__(label=label, style=style)
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if isinstance(interaction.guild, discord.Guild):
-            member = interaction.guild.get_member(self.member_id)
-            if isinstance(member, discord.Member):
-                await member.kick()
-                await interaction.response.edit_message(
-                    content=f"## {interaction.user.mention} kicked {member.mention}",
-                    view=None,
-                )
-
-
 @client.event
 async def on_member_update(before: discord.Member, after: discord.Member) -> None:
+    is_new = (not after.joined_at) or (
+        (after.joined_at - datetime.datetime.now(datetime.timezone.utc))
+        < datetime.timedelta(days=1)
+    )
+    has_role = any(
+        t for t in ROLES_COLLECTION.find() if t["_id"] in [a.id for a in after.roles]
+    )
     if any(
         t
         for t in TRIGGER_COLLECTION.find()
         if t["_id"] not in [b.id for b in before.roles]
         and t["_id"] in [a.id for a in after.roles]
-    ) and not any(
-        t for t in ROLES_COLLECTION.find() if t["_id"] in [a.id for a in after.roles]
-    ):
-        await after.send(
-            f"# Welcome {after.mention}!\nTo help our dear admins to better get you started I am here to help you link your RSI profile to our Discord.\n\nIt is actually quite simple. Please just run the command `{PREFIX}profile username` and your're all set!\n\nAnd don't worry, you can always update this again with the same command if you make a mistake."
-        )
+    ) and (not has_role or is_new):
+        description = f"## What we know about them:\n"
+        try:
+            await after.send(WELCOME_MSG.format(member=after.mention, prefix=PREFIX))
+        except discord.errors.Forbidden:
+            description = f"{after.mention} has disabled the ability for bots to send them direct messages - **please ask them to add their RSI profile manually with `{PREFIX}profile`**\n{description}"
         adminchal = CONFIG_COLLECTION.find_one({"_id": "adminchal"})
         if adminchal:
             channel = after.guild.get_channel(adminchal["channel"])
@@ -1997,7 +1310,7 @@ async def on_member_update(before: discord.Member, after: discord.Member) -> Non
                 after_role_ids = [r.id for r in after.roles]
                 embed = discord.Embed(
                     title=after.name,
-                    description=f"What we know about them:\n"
+                    description=description
                     + "\n".join(
                         f'- {j["text"]}'
                         for j in JOIN_COLLECTION.find()
