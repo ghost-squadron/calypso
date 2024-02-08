@@ -3,6 +3,7 @@ discord
 httpx
 loguru
 markdownify
+mathutils
 mypy
 pydantic
 pymongo

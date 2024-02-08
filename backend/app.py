@@ -19,18 +19,10 @@ from constants import *
 from loguru import logger
 from rsi_profile import (extract_profile_info, org_to_embed, orgs_lookup,
                          profile_to_embed, url_to_org)
-from snare import (line_point_dist, perpendicular_unit_vector,
-                   point_point_dist, pretty_print_dist)
+from snare import (Snare, line_point_dist, location_to_str, point_point_dist,
+                   pretty_print_dist)
 
-mongodb_client: pymongo.MongoClient = pymongo.MongoClient(MONGODB_DOMAIN, 27017)
-DB = mongodb_client["database"]
-USERS_COLLECTION = DB["users"]
-ROLES_COLLECTION = DB["roles"]
-WINGS_COLLECTION = DB["wings"]
-CONFIG_COLLECTION = DB["config"]
-JOIN_COLLECTION = DB["join"]
-TRIGGER_COLLECTION = DB["trigger"]
-
+mongo: pymongo.MongoClient = pymongo.MongoClient(MONGODB_DOMAIN, 27017)
 
 client = discord.Client(command_prefix=PREFIX, intents=discord.Intents.all())
 tree = discord.app_commands.CommandTree(client)
@@ -44,7 +36,9 @@ class LetInButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction) -> None:
         if isinstance(interaction.guild, discord.Guild):
             member = interaction.guild.get_member(self.member_id)
-            startrole = CONFIG_COLLECTION.find_one({"_id": "startrole"})
+            startrole = mongo[str(interaction.guild.id)]["config"].find_one(
+                {"_id": "startrole"}
+            )
             if startrole and member:
                 role = interaction.guild.get_role(startrole["role"])
                 if role:
@@ -70,16 +64,6 @@ class LetInButton(discord.ui.Button):
             logger.warning(
                 f"LetInButton instantiazed outside Guild: {self.member_id} | {interaction}"
             )
-
-
-def location_to_str(location: dict) -> str:
-    match location["Type"]:
-        case "RestStop" | "Refinery Station" | "Naval Station":
-            return f'{location["InternalName"].replace("Station", "").strip()} - {location["ObjectContainer"].strip()}'.strip()
-        case "Moon" | "Planet":
-            return str(location["ObjectContainer"].strip())
-        case _:
-            return f'{location["InternalName"].strip()} - {location["ObjectContainer"].strip()}'.strip()
 
 
 def is_admin(interaction: discord.Interaction) -> bool:
@@ -112,7 +96,7 @@ def get_members_without_rsi_profiles(guild: discord.Guild) -> list[discord.Membe
     return [
         m
         for m in guild.members
-        if not m.bot and not USERS_COLLECTION.find_one({"_id": m.id})
+        if not m.bot and not mongo["global"]["profiles"].find_one({"_id": m.id})
     ]
 
 
@@ -121,7 +105,7 @@ def get_members_with_rsi_profiles(
 ) -> list[tuple[discord.Member, dict]]:
     res: list[tuple[discord.Member, dict]] = []
     for m in guild.members:
-        if not m.bot and (dbm := USERS_COLLECTION.find_one({"_id": m.id})):
+        if not m.bot and (dbm := mongo["global"]["profiles"].find_one({"_id": m.id})):
             res.append((m, dbm))
     return res
 
@@ -139,13 +123,15 @@ def get_desired_nick(
     sorted_db_roles: list | None = None,
     db_wings: list | None = None,
 ) -> str | None:
+    GUILD_DB = mongo[str(member.guild.id)]
+
     if not sorted_db_roles:
-        sorted_db_roles = sorted(ROLES_COLLECTION.find(), key=lambda r: r["priority"])
+        sorted_db_roles = sorted(GUILD_DB["roles"].find(), key=lambda r: r["priority"])
 
     if not db_wings:
-        db_wings = list(WINGS_COLLECTION.find())
+        db_wings = list(GUILD_DB["wings"].find())
 
-    db_user = USERS_COLLECTION.find_one({"_id": member.id})
+    db_user = mongo["global"]["profiles"].find_one({"_id": member.id})
     if db_user:
         middle = db_user["nick"]
     else:
@@ -155,8 +141,10 @@ def get_desired_nick(
 
 
 def get_wrong_nicks(guild: discord.Guild) -> list[tuple]:
-    sorted_db_roles = sorted(ROLES_COLLECTION.find(), key=lambda r: r["priority"])
-    db_wings = list(WINGS_COLLECTION.find())
+    GUILD_DB = mongo[str(guild.id)]
+
+    sorted_db_roles = sorted(GUILD_DB["roles"].find(), key=lambda r: r["priority"])
+    db_wings = list(GUILD_DB["wings"].find())
     wrong_nicks = []
     for member in guild.members:
         if not member.bot:
@@ -199,132 +187,44 @@ async def snare(
     destination: discord.app_commands.Choice[int],
 ) -> None:
     await interaction.response.defer(thinking=True)
-    source_obj = next(l for l in LOCATIONS if location_to_str(l) == source.name)
-    destination_obj = next(
-        l for l in LOCATIONS if location_to_str(l) == destination.name
-    )
 
-    # The travel source represented as a 3D coordinate
-    source_point = numpy.array(
-        [source_obj["XCoord"], source_obj["YCoord"], source_obj["ZCoord"]]
-    )
-
-    # The travel distination represented as a 3D coordinate
-    destination_point = numpy.array(
-        [
-            destination_obj["XCoord"],
-            destination_obj["YCoord"],
-            destination_obj["ZCoord"],
-        ]
-    )
-
-    # Represents the centerline as a vector
-    # with origin in the source point
-    centerline_vector = source_point - destination_point
-
-    # Calculate the point on the centerline
-    # where you enter the physics grid of the destination
-    point_of_physics = (
-        destination_point
-        + centerline_vector
-        / point_point_dist(destination_point, source_point)
-        * destination_obj["GRIDRadius"]
-    )
-
-    # Orbital Markers are generally the furthest away from the center
-    # of a celestial body anybody traveling from said body will travel before
-    # jumping towards a new target
-    om_radius = source_obj["OrbitalMarkerRadius"] or DEFAULT_OM_RADIUS
-
-    # All OM points orbit at the same height - this variable represents
-    # an imaginary abitrary OM point placed perpendicular on the centerline
-    # i.e. the worst case in order to catch a potential traveller
-    puv = perpendicular_unit_vector(destination_point - source_point)
-    assert numpy.linalg.norm(puv) == 1.0
-    arbitrary_om_point = source_point + puv * om_radius
-
-    # A linalg representation of an arbitrary worst case travel line
-    hyp = (arbitrary_om_point, destination_point)
-
-    # Approximates the point (down to 0.01m) closest to the source point
-    # on the centerline which is less than 20,000m (snare range) from
-    # the worst case travel line
-    # i.e. the earliest possible point to catch everyone
-    sp = source_point
-    dp = point_of_physics
-    while point_point_dist(sp, dp) > 0.01:
-        h = sp + (dp - sp) / 2
-        hd = line_point_dist(hyp, h)
-        if hd < 20_000:
-            dp = h
-        else:
-            sp = h
-    min_pullout = h
-    min_pullout_dist = point_point_dist(min_pullout, destination_point)
-
-    # Approximates the point (down to 0.01m) where a ship would have to travel
-    # the furthest to escape the cone in which it would still catch everyone
-    sp = min_pullout
-    dp = point_of_physics
-    while point_point_dist(sp, dp) > 0.01:
-        h = sp + (dp - sp) / 2
-        hd = 20_000 - line_point_dist(hyp, h)
-        hpp = point_point_dist(h, point_of_physics)
-        if hpp > hd:
-            sp = h
-        else:
-            dp = h
-    optimal_pullout = h
-    optimal_pullout_dist = point_point_dist(optimal_pullout, destination_point)
-
-    # Calculate the coverage
-    # i.e. at the clostest point possible to the destination (just before the physics grid)
-    # how much of the required area to catch everyone does a 20,000m radius cover
-    point_of_physics_radius = line_point_dist(hyp, point_of_physics)
-    point_of_physics_area = point_of_physics_radius**2 * math.pi
-    snare_coverage = 20_000**2 * math.pi
-    coverage = snare_coverage / point_of_physics_area
+    snare = Snare(source.name, destination.name)
 
     embed = discord.Embed(
         title=f"Full Coverage Snare Plan",
-        description=f"`{location_to_str(source_obj)} -> {location_to_str(destination_obj)}`"
+        description=f"`{location_to_str(snare.source)} -> {location_to_str(snare.destination)}`"
         + (
-            f"\n## ❌ Only {coverage*100:.1f}% coverage possible on this route!\nJust get as close to the Physics grid (**without passing into it**) on the centerline as you dare. The better you do the more you'll catch."
-            if coverage < 1
-            else f"\n## ✅ Full route coverage possible\nAs always, try to get as close to the centerline as possible.\n\nAt `{pretty_print_dist(optimal_pullout_dist)}` from `{location_to_str(destination_obj)}` you'll have `{pretty_print_dist(20_000 - line_point_dist(hyp, optimal_pullout))}` of leeway to be off the centerline and be `{pretty_print_dist(point_point_dist(optimal_pullout, point_of_physics))}` away from the physics grid of `{location_to_str(destination_obj)}`. This is therefore the location that gives you the most leeway in all directions."
+            f"\n## ❌ Only {snare.coverage*100:.1f}% coverage possible on this route!\nJust get as close to the Physics grid (**without passing into it**) on the centerline as you dare. The better you do the more you'll catch."
+            if snare.coverage < 1
+            else f"\n## ✅ Full route coverage possible\nAs always, try to get as close to the centerline as possible.\n\nAt `{pretty_print_dist(snare.optimal_pullout_dist)}` from `{location_to_str(snare.destination)}` you'll have `{pretty_print_dist(20_000 - line_point_dist(snare.hyp, snare.optimal_pullout))}` of leeway to be off the centerline and be `{pretty_print_dist(point_point_dist(snare.optimal_pullout, snare.point_of_physics))}` away from the physics grid of `{location_to_str(snare.destination)}`. This is therefore the location that gives you the most leeway in all directions."
         ),
-        colour=discord.Colour.red() if coverage < 1 else discord.Colour.green(),
+        colour=discord.Colour.red() if snare.coverage < 1 else discord.Colour.green(),
     )
     view = discord.ui.View()
 
     embed.add_field(
         name="Centerline length",
-        value=pretty_print_dist(point_point_dist(source_point, destination_point)),
+        value=pretty_print_dist(
+            point_point_dist(snare.source_point, snare.destination_point)
+        ),
     )
     embed.add_field(
-        name=f'"{location_to_str(source_obj)}" physics grid range',
-        value=pretty_print_dist(source_obj["GRIDRadius"]),
+        name=f'"{location_to_str(snare.source)}" physics grid range',
+        value=pretty_print_dist(snare.source["GRIDRadius"]),
     )
     embed.add_field(
-        name=f'"{location_to_str(destination_obj)}" physics grid range',
-        value=pretty_print_dist(destination_obj["GRIDRadius"]),
+        name=f'"{location_to_str(snare.destination)}" physics grid range',
+        value=pretty_print_dist(snare.destination["GRIDRadius"]),
     )
-    if coverage >= 1:
+    if snare.coverage >= 1:
         embed.add_field(
-            name="Earliest pullout", value=pretty_print_dist(min_pullout_dist)
+            name="Earliest pullout", value=pretty_print_dist(snare.min_pullout_dist)
         )
         embed.add_field(
-            name="Optimal pullout", value=pretty_print_dist(optimal_pullout_dist)
+            name="Optimal pullout", value=pretty_print_dist(snare.optimal_pullout_dist)
         )
         view.add_item(
-            SnareCheckButton(
-                (source_point, destination_point),
-                hyp,
-                destination_obj["GRIDRadius"],
-                float(optimal_pullout_dist),
-                "Check my location!",
-                discord.ButtonStyle.green,
-            )
+            SnareCheckButton(snare, "Check my location!", discord.ButtonStyle.green)
         )
 
     await interaction.followup.send(embed=embed, view=view)
@@ -342,22 +242,24 @@ async def profile(interaction: discord.Interaction, username: str) -> None:
         )
 
     if isinstance(profile, Profile):
+        COLLECTION = mongo["global"]["profiles"]
+
         db_user = {
             "_id": interaction.user.id,
             "url": RSI_BASE_URL + urllib.parse.quote(profile.handle),
             "nick": profile.handle,
         }
         try:
-            USERS_COLLECTION.insert_one(db_user)
+            COLLECTION.insert_one(db_user)
         except pymongo.errors.DuplicateKeyError:
-            USERS_COLLECTION.replace_one({"_id": db_user["_id"]}, db_user)
+            COLLECTION.replace_one({"_id": db_user["_id"]}, db_user)
 
         if isinstance(interaction.user, discord.Member):
             try:
                 await interaction.user.edit(nick=get_desired_nick(interaction.user))
             except discord.errors.Forbidden as e:
                 logger.warning(
-                    f'Cannot change nickname for "{interaction.user.mention}": {e}'
+                    f'Cannot change nickname for "{interaction.user.name}": {e}'
                 )
 
         await interaction.followup.send(
@@ -381,7 +283,7 @@ async def whois(interaction: discord.Interaction, member: discord.Member) -> Non
         await interaction.followup.send(embed=get_bot_embed())
         return
 
-    db_user = USERS_COLLECTION.find_one({"_id": member.id})
+    db_user = mongo["global"]["profiles"].find_one({"_id": member.id})
     view = discord.ui.View()
 
     if db_user:
@@ -519,7 +421,7 @@ async def feedback(
 
     await interaction.response.defer(thinking=True, ephemeral=True)
 
-    GUILD_DB = mongodb_client[str(interaction.guild.id)]
+    GUILD_DB = mongo[str(interaction.guild.id)]
     COLLECTION = GUILD_DB[f"feedback-{interaction.user.id}"]
 
     initial = COLLECTION.find_one({"_id": member.id}) or {}
@@ -534,12 +436,18 @@ async def feedback(
     except pymongo.errors.DuplicateKeyError:
         COLLECTION.replace_one({"_id": member.id}, new)
 
-    if initial != new:
-        for admin in get_feedback_admins(GUILD_DB["config"], interaction.guild):
-            embed = discord.Embed(title="Feedback updated")
-            embed.add_field(name="Giver", value=f"<@{interaction.user.id}>")
-            embed.add_field(name="Reciever", value=f"<@{member.id}>")
-            await admin.send(embed=embed)
+    feedback_channel = GUILD_DB["config"].find_one({"_id": "feedbackchannel"})
+    if isinstance(feedback_channel, dict) and "value" in feedback_channel:
+        if initial != new:
+            for channel in interaction.guild.channels:
+                if (
+                    isinstance(channel, discord.TextChannel)
+                    and channel.id == feedback_channel["value"]
+                ):
+                    embed = discord.Embed(title="Feedback updated")
+                    embed.add_field(name="Giver", value=f"<@{interaction.user.id}>")
+                    embed.add_field(name="Reciever", value=f"<@{member.id}>")
+                    await channel.send(embed=embed)
 
     await interaction.followup.send(
         embed=discord.Embed(
@@ -568,7 +476,7 @@ async def myfeedback(
 
     await interaction.response.defer(thinking=True, ephemeral=True)
 
-    GUILD_DB = mongodb_client[str(interaction.guild.id)]
+    GUILD_DB = mongo[str(interaction.guild.id)]
     COLLECTION = GUILD_DB[f"feedback-{interaction.user.id}"]
 
     await interaction.followup.send(
@@ -589,33 +497,115 @@ async def myfeedback(
 CURRENT_OPS = {}
 
 
-@tree.command(
-    name="allfeedback",
-    description="List all feedback given to a specific member",
-)
-async def allfeedback(interaction: discord.Interaction, member: discord.Member) -> None:
+@tree.command(name="adminprofile", description="Set RSI profiles for specific user")
+async def adminprofile(
+    interaction: discord.Interaction, member: discord.Member, username: str
+) -> None:
     if not interaction.guild:
         return
 
     await interaction.response.defer(thinking=True, ephemeral=True)
+    url = RSI_BASE_URL + username
+    try:
+        profile = extract_profile_info(url)
+    except ParsingException as e:
+        await interaction.followup.send(
+            f"An error happened, please contact an admin and send them the following: {url} | {e}",
+            ephemeral=True,
+        )
 
-    GUILD_DB = mongodb_client[str(interaction.guild.id)]
+    if isinstance(profile, Profile):
+        COLLECTION = mongo["global"]["profiles"]
 
-    description = ""
-    for collection_name in GUILD_DB.list_collection_names():
-        if "feedback-" in collection_name and (
-            f := GUILD_DB[collection_name].find_one({"_id": member.id})
-        ):
-            member_id = collection_name.split("-")[-1]
-            description += (
-                f"\n# <@{member_id}>"
-                + (f" - Vote: {Vote(f['vote']).name}" if f["vote"] != None else "")
-                + (f'\n{f["feedback"]}' if f["feedback"] != None else "")
-            )
+        db_user = {
+            "_id": member.id,
+            "url": RSI_BASE_URL + urllib.parse.quote(profile.handle),
+            "nick": profile.handle,
+        }
+        try:
+            COLLECTION.insert_one(db_user)
+        except pymongo.errors.DuplicateKeyError:
+            COLLECTION.replace_one({"_id": db_user["_id"]}, db_user)
 
-    await interaction.followup.send(
-        embed=discord.Embed(description=description), ephemeral=True
-    )
+        try:
+            await member.edit(nick=get_desired_nick(member))
+        except discord.errors.Forbidden as e:
+            logger.warning(f'Cannot change nickname for "{member.mention}": {e}')
+
+        await interaction.followup.send(
+            f"Updated linked RSI profile for user {member.mention} ✅\nRemember you can always update your profile with `{PREFIX}profile username`",
+            embed=profile_to_embed(profile),
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(
+            f'Could not find "{username}", please type your exact username (case insensitive) from https://robertsspaceindustries.com',
+            ephemeral=True,
+        )
+
+
+@tree.command(
+    name="allfeedback",
+    description="List all feedback. Either in total or given to a specific member",
+)
+async def allfeedback(
+    interaction: discord.Interaction, member: discord.Member | None
+) -> None:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    GUILD_DB = mongo[str(interaction.guild.id)]
+    fba = list(get_feedback_admins(GUILD_DB["config"], interaction.guild))
+
+    if interaction.user not in fba:
+        await interaction.followup.send(
+            'Command only awailable for "feedback admins" - which you are not!'
+        )
+        return
+
+    embeds = []
+    if member:
+        description = f"# Feedback for {member.mention}:"
+        for collection_name in GUILD_DB.list_collection_names():
+            if "feedback-" in collection_name and (
+                f := GUILD_DB[collection_name].find_one({"_id": member.id})
+            ):
+                member_id = collection_name.split("-")[-1]
+                description += (
+                    f"\n## Giver: <@{member_id}>"
+                    + (f" | Vote: {Vote(f['vote']).name}" if f["vote"] != None else "")
+                    + (f'\n{f["feedback"]}' if f["feedback"] != None else "")
+                )
+        description = (
+            description.strip() or f"No feedback given for {member.mention} yet"
+        )
+        embeds.append(discord.Embed(description=description))
+    else:
+        for collection_name in GUILD_DB.list_collection_names():
+            if "feedback-" in collection_name:
+                description = f'# Feedback for <@{collection_name.split("-")[-1]}>'
+                for f in GUILD_DB[collection_name].find():
+                    description += (
+                        f"\n## Giver: <@{f['_id']}>"
+                        + (
+                            f" | Vote: {Vote(f['vote']).name}"
+                            if f["vote"] != None
+                            else ""
+                        )
+                        + (f'\n{f["feedback"]}' if f["feedback"] != None else "")
+                    )
+                if description:
+                    embeds.append(discord.Embed(description=description))
+
+    if embeds:
+        await interaction.followup.send(embeds=embeds, ephemeral=True)
+    else:
+        await interaction.followup.send(
+            "No feedback given yet" + (f" for {member.mention}" if member else ""),
+            ephemeral=True,
+        )
 
 
 @tree.command(
@@ -628,7 +618,7 @@ async def feedbackadmin(interaction: discord.Interaction, role: discord.Role) ->
 
     await interaction.response.defer(thinking=True, ephemeral=True)
 
-    GUILD_DB = mongodb_client[str(interaction.guild.id)]
+    GUILD_DB = mongo[str(interaction.guild.id)]
     COLLECTION = GUILD_DB["config"]
     try:
         COLLECTION.insert_one({"_id": "feedbackadminrole", "value": role.id})
@@ -647,36 +637,32 @@ async def feedbackadmin(interaction: discord.Interaction, role: discord.Role) ->
     )
 
 
-# @tree.command(
-#     name="funny",
-# )
-# async def funny(
-#     interaction: discord.Interaction,
-#     message_id: str,
-#     response: str,
-# ) -> None:
-#     if not interaction.guild or not await check_admin(interaction):
-#         return
-#     message_id_int = int(message_id)
+@tree.command(
+    name="feedbackchannel",
+    description="Set feedback updates channel",
+)
+async def feedbackchannel(
+    interaction: discord.Interaction, channel: discord.TextChannel
+) -> None:
+    if not interaction.guild or not await check_admin(interaction):
+        return
 
-#     message = None
-#     for channel in interaction.guild.channels:
-#         if isinstance(channel, discord.TextChannel):
-#             try:
-#                 message = await channel.fetch_message(message_id_int)
-#                 await message.reply(response)
-#                 await interaction.response.send_message(
-#                     "Funny done!", delete_after=MESSAGE_TIMEOUT, ephemeral=True
-#                 )
-#                 return
-#             except discord.errors.NotFound:
-#                 ...
+    await interaction.response.defer(thinking=True, ephemeral=True)
 
-#     await interaction.followup.send_message(
-#         f'Could not find message "{message_id_int}"',
-#         delete_after=MESSAGE_TIMEOUT,
-#         ephemeral=True,
-#     )
+    GUILD_DB = mongo[str(interaction.guild.id)]
+    COLLECTION = GUILD_DB["config"]
+    try:
+        COLLECTION.insert_one({"_id": "feedbackchannel", "value": channel.id})
+    except pymongo.errors.DuplicateKeyError:
+        COLLECTION.replace_one({"_id": "feedbackchannel"}, {"value": channel.id})
+
+    await interaction.followup.send(
+        embed=discord.Embed(
+            title="Feedback updates channel",
+            description=f"<#{COLLECTION.find_one({'_id': 'feedbackchannel'})['value']}>",  # type: ignore
+        ),
+        ephemeral=True,
+    )
 
 
 @tree.command(
@@ -695,7 +681,7 @@ async def startop(
 
     await interaction.response.defer(thinking=True)
 
-    GUILD_DB = mongodb_client[str(interaction.guild.id)]
+    GUILD_DB = mongo[str(interaction.guild.id)]
     COLLECTION = GUILD_DB["ops"]
     VOICE_IDS = {"Dorothy": "ThT5KcBeYPX3keUQqHPh", "Grace": "oWAxZDx7w5VEj9dCyTzz"}
 
@@ -795,7 +781,7 @@ async def listops(interaction: discord.Interaction) -> None:
         return
     assert interaction.guild
 
-    GUILD_DB = mongodb_client[str(interaction.guild.id)]
+    GUILD_DB = mongo[str(interaction.guild.id)]
     COLLECTION = GUILD_DB["ops"]
     embed = discord.Embed(title="Operations")
     for c in COLLECTION.find():
@@ -819,7 +805,7 @@ async def setop(
     lookup = lookup.lower().strip()
     description = description.strip()
 
-    GUILD_DB = mongodb_client[str(interaction.guild.id)]
+    GUILD_DB = mongo[str(interaction.guild.id)]
     COLLECTION = GUILD_DB["ops"]
     try:
         COLLECTION.insert_one({"_id": lookup, "description": description})
@@ -842,7 +828,7 @@ async def setbotvoice(
     if not interaction.guild or not await check_admin(interaction):
         return
 
-    GUILD_DB = mongodb_client[str(interaction.guild.id)]
+    GUILD_DB = mongo[str(interaction.guild.id)]
     COLLECTION = GUILD_DB["config"]
     try:
         COLLECTION.insert_one({"_id": "botvoice", "value": channel.id})
@@ -889,6 +875,14 @@ async def clear(interaction: discord.Interaction) -> None:
     description="Sets the currently associated RSI org",
 )
 async def setorg(interaction: discord.Interaction, sid: str) -> None:
+    if not isinstance(interaction.guild, discord.Guild):
+        await interaction.response.send_message(
+            "Command only available inside guild",
+            ephemeral=True,
+            delete_after=MESSAGE_TIMEOUT,
+        )
+        return
+
     if not await check_admin(interaction):
         return
 
@@ -902,14 +896,14 @@ async def setorg(interaction: discord.Interaction, sid: str) -> None:
         await interaction.response.send_message(
             f'Could not organisation on "{url}": {e}', delete_after=MESSAGE_TIMEOUT
         )
-
+    COLLECTION = mongo[str(interaction.guild.id)]["config"]
     try:
-        CONFIG_COLLECTION.insert_one({"_id": "rsiorg", "sid": sid})
+        COLLECTION.insert_one({"_id": "rsiorg", "sid": sid})
         await interaction.response.send_message(
             embed=embed, delete_after=MESSAGE_TIMEOUT
         )
     except pymongo.errors.DuplicateKeyError:
-        CONFIG_COLLECTION.replace_one({"_id": "rsiorg"}, {"sid": sid})
+        COLLECTION.replace_one({"_id": "rsiorg"}, {"sid": sid})
         await interaction.response.send_message(
             embed=embed, delete_after=MESSAGE_TIMEOUT
         )
@@ -928,19 +922,28 @@ async def addrole(
 ) -> None:
     if not await check_admin(interaction):
         return
-
-    db_role = {"_id": role.id, "icon": icon, "priority": priority, "rsirank": rsirank}
-    try:
-        ROLES_COLLECTION.insert_one(db_role)
+    if not isinstance(interaction.guild, discord.Guild):
         await interaction.response.send_message(
-            f"Added role: {role.mention} (`{priority} | {rsirank}/5 | {icon}`)",
+            "Command only available inside guild",
+            ephemeral=True,
             delete_after=MESSAGE_TIMEOUT,
         )
+        return
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    COLLECTION = mongo[str(interaction.guild.id)]["roles"]
+    db_role = {"_id": role.id, "icon": icon, "priority": priority, "rsirank": rsirank}
+    try:
+        COLLECTION.insert_one(db_role)
+        await interaction.followup.send(
+            f"Added role: {role.mention} (`{priority} | {rsirank}/5 | {icon}`)",
+            ephemeral=True,
+        )
     except pymongo.errors.DuplicateKeyError:
-        ROLES_COLLECTION.replace_one({"_id": role.id}, db_role)
-        await interaction.response.send_message(
+        COLLECTION.replace_one({"_id": role.id}, db_role)
+        await interaction.followup.send(
             f"Updated role: {role.mention} (`{priority} | {rsirank}/5 | {icon}`)",
-            delete_after=MESSAGE_TIMEOUT,
+            ephemeral=True,
         )
 
 
@@ -953,15 +956,23 @@ async def addwing(
 ) -> None:
     if not await check_admin(interaction):
         return
+    if not isinstance(interaction.guild, discord.Guild):
+        await interaction.response.send_message(
+            "Command only available inside guild",
+            ephemeral=True,
+            delete_after=MESSAGE_TIMEOUT,
+        )
+        return
 
+    COLLECTION = mongo[str(interaction.guild.id)]["wings"]
     db_role = {"_id": role.id, "icon": icon}
     try:
-        WINGS_COLLECTION.insert_one(db_role)
+        COLLECTION.insert_one(db_role)
         await interaction.response.send_message(
             f"Added wing: {role.mention} - {icon}", delete_after=MESSAGE_TIMEOUT
         )
     except pymongo.errors.DuplicateKeyError:
-        WINGS_COLLECTION.replace_one({"_id": role.id}, db_role)
+        COLLECTION.replace_one({"_id": role.id}, db_role)
         await interaction.response.send_message(
             f"Updated wing: {role.mention} - {icon}", delete_after=MESSAGE_TIMEOUT
         )
@@ -974,8 +985,15 @@ async def addwing(
 async def delrole(interaction: discord.Interaction, role: discord.Role) -> None:
     if not await check_admin(interaction):
         return
+    if not isinstance(interaction.guild, discord.Guild):
+        await interaction.response.send_message(
+            "Command only available inside guild",
+            ephemeral=True,
+            delete_after=MESSAGE_TIMEOUT,
+        )
+        return
 
-    res = ROLES_COLLECTION.delete_one({"_id": role.id})
+    res = mongo[str(interaction.guild.id)]["roles"].delete_one({"_id": role.id})
 
     if not res.deleted_count:
         await interaction.response.send_message(
@@ -995,8 +1013,15 @@ async def delrole(interaction: discord.Interaction, role: discord.Role) -> None:
 async def delwing(interaction: discord.Interaction, role: discord.Role) -> None:
     if not await check_admin(interaction):
         return
+    if not isinstance(interaction.guild, discord.Guild):
+        await interaction.response.send_message(
+            "Command only available inside guild",
+            ephemeral=True,
+            delete_after=MESSAGE_TIMEOUT,
+        )
+        return
 
-    res = WINGS_COLLECTION.delete_one({"_id": role.id})
+    res = mongo[str(interaction.guild.id)]["wings"].delete_one({"_id": role.id})
 
     if not res.deleted_count:
         await interaction.response.send_message(
@@ -1016,9 +1041,19 @@ async def delwing(interaction: discord.Interaction, role: discord.Role) -> None:
 async def listroles(interaction: discord.Interaction) -> None:
     if not await check_admin(interaction):
         return
+    if not isinstance(interaction.guild, discord.Guild):
+        await interaction.response.send_message(
+            "Command only available inside guild",
+            ephemeral=True,
+            delete_after=MESSAGE_TIMEOUT,
+        )
+        return
 
     roles: list[dict] = list(
-        sorted(ROLES_COLLECTION.find(), key=lambda r: r["priority"])
+        sorted(
+            mongo[str(interaction.guild.id)]["roles"].find(),
+            key=lambda r: r["priority"],
+        )
     )
     if not roles:
         await interaction.response.send_message(
@@ -1045,12 +1080,20 @@ async def listroles(interaction: discord.Interaction) -> None:
 async def listwings(interaction: discord.Interaction) -> None:
     if not await check_admin(interaction) or not interaction.guild:
         return
+    if not isinstance(interaction.guild, discord.Guild):
+        await interaction.response.send_message(
+            "Command only available inside guild",
+            ephemeral=True,
+            delete_after=MESSAGE_TIMEOUT,
+        )
+        return
 
+    COLLECTION = mongo[str(interaction.guild.id)]["wings"]
     wings: list[dict] = []
     role_ids = [w.id for w in interaction.guild.roles]
-    for wing in WINGS_COLLECTION.find():
+    for wing in COLLECTION.find():
         if wing["_id"] not in role_ids:
-            WINGS_COLLECTION.delete_one(wing)
+            COLLECTION.delete_one(wing)
         else:
             wings.append(wing)
 
@@ -1089,6 +1132,17 @@ async def status(interaction: discord.Interaction) -> None:
         description = f"✅{description}\n"
     else:
         description = f"❌{description}\n"
+        view.add_item(
+            GenericShowEmbedButton(
+                discord.Embed(
+                    title="Members missing RSI profiles",
+                    description="\n".join(f"- {m.mention}" for m in missing_members),
+                ),
+                None,
+                label="Show members missing RSI Profiles",
+                style=discord.ButtonStyle.red,
+            )
+        )
 
     wrong_nicks = get_wrong_nicks(interaction.guild)
     if not wrong_nicks:
@@ -1145,13 +1199,14 @@ async def adminchal(
 
     assert interaction.guild
 
+    COLLECTION = mongo[str(interaction.guild.id)]["config"]
     try:
-        CONFIG_COLLECTION.insert_one({"_id": "adminchal", "channel": channel.id})
+        COLLECTION.insert_one({"_id": "adminchal", "channel": channel.id})
         await interaction.response.send_message(
             f"Added admin channel {channel.mention}", delete_after=MESSAGE_TIMEOUT
         )
     except pymongo.errors.DuplicateKeyError:
-        CONFIG_COLLECTION.replace_one({"_id": "adminchal"}, {"channel": channel.id})
+        COLLECTION.replace_one({"_id": "adminchal"}, {"channel": channel.id})
         await interaction.response.send_message(
             f"Updated admin channel {channel.mention}", delete_after=MESSAGE_TIMEOUT
         )
@@ -1167,13 +1222,14 @@ async def startrole(interaction: discord.Interaction, role: discord.Role) -> Non
 
     assert interaction.guild
 
+    COLLECTION = mongo[str(interaction.guild.id)]["config"]
     try:
-        CONFIG_COLLECTION.insert_one({"_id": "startrole", "role": role.id})
+        COLLECTION.insert_one({"_id": "startrole", "role": role.id})
         await interaction.response.send_message(
             f"Added starting role {role.mention}", delete_after=MESSAGE_TIMEOUT
         )
     except pymongo.errors.DuplicateKeyError:
-        CONFIG_COLLECTION.replace_one({"_id": "startrole"}, {"role": role.id})
+        COLLECTION.replace_one({"_id": "startrole"}, {"role": role.id})
         await interaction.response.send_message(
             f"Updated starting role {role.mention}", delete_after=MESSAGE_TIMEOUT
         )
@@ -1188,14 +1244,22 @@ async def addjoin(
 ) -> None:
     if not await check_admin(interaction):
         return
+    if not isinstance(interaction.guild, discord.Guild):
+        await interaction.response.send_message(
+            "Command only available inside guild",
+            ephemeral=True,
+            delete_after=MESSAGE_TIMEOUT,
+        )
+        return
 
+    COLLECTION = mongo[str(interaction.guild.id)]["join"]
     try:
-        JOIN_COLLECTION.insert_one({"_id": role.id, "text": text})
+        COLLECTION.insert_one({"_id": role.id, "text": text})
         await interaction.response.send_message(
             f"Added text for join role {role.mention}", delete_after=MESSAGE_TIMEOUT
         )
     except pymongo.errors.DuplicateKeyError:
-        JOIN_COLLECTION.replace_one({"_id": role.id}, {"text": text})
+        COLLECTION.replace_one({"_id": role.id}, {"text": text})
         await interaction.response.send_message(
             f"Updated text for join role {role.mention}", delete_after=MESSAGE_TIMEOUT
         )
@@ -1208,8 +1272,15 @@ async def addjoin(
 async def listjoin(interaction: discord.Interaction) -> None:
     if not await check_admin(interaction):
         return
+    if not isinstance(interaction.guild, discord.Guild):
+        await interaction.response.send_message(
+            "Command only available inside guild",
+            ephemeral=True,
+            delete_after=MESSAGE_TIMEOUT,
+        )
+        return
 
-    join_texts: list[dict] = list(JOIN_COLLECTION.find())
+    join_texts: list[dict] = list(mongo[str(interaction.guild.id)]["join"].find())
     if not join_texts:
         await interaction.response.send_message(
             "No join texts added yet", delete_after=MESSAGE_TIMEOUT
@@ -1234,7 +1305,7 @@ async def addtrigger(interaction: discord.Interaction, role: discord.Role) -> No
     assert interaction.guild
 
     try:
-        TRIGGER_COLLECTION.insert_one({"_id": role.id})
+        mongo[str(interaction.guild.id)]["trigger"].insert_one({"_id": role.id})
         await interaction.response.send_message(
             f"{role.mention} added as trigger role", delete_after=MESSAGE_TIMEOUT
         )
@@ -1252,8 +1323,15 @@ async def addtrigger(interaction: discord.Interaction, role: discord.Role) -> No
 async def listtriggers(interaction: discord.Interaction) -> None:
     if not await check_admin(interaction):
         return
+    if not isinstance(interaction.guild, discord.Guild):
+        await interaction.response.send_message(
+            "Command only available inside guild",
+            ephemeral=True,
+            delete_after=MESSAGE_TIMEOUT,
+        )
+        return
 
-    trigger_roles: list[dict] = list(TRIGGER_COLLECTION.find())
+    trigger_roles: list[dict] = list(mongo[str(interaction.guild.id)]["trigger"].find())
     if not trigger_roles:
         await interaction.response.send_message(
             "No trigger roles added yet", delete_after=MESSAGE_TIMEOUT
@@ -1273,12 +1351,13 @@ async def on_member_update(before: discord.Member, after: discord.Member) -> Non
         (after.joined_at - datetime.datetime.now(datetime.timezone.utc))
         < datetime.timedelta(days=1)
     )
+    GUILD_DB = mongo[str(after.guild.id)]
     has_role = any(
-        t for t in ROLES_COLLECTION.find() if t["_id"] in [a.id for a in after.roles]
+        t for t in GUILD_DB["roles"].find() if t["_id"] in [a.id for a in after.roles]
     )
     if any(
         t
-        for t in TRIGGER_COLLECTION.find()
+        for t in GUILD_DB["config"].find()
         if t["_id"] not in [b.id for b in before.roles]
         and t["_id"] in [a.id for a in after.roles]
     ) and (not has_role or is_new):
@@ -1287,7 +1366,7 @@ async def on_member_update(before: discord.Member, after: discord.Member) -> Non
             await after.send(WELCOME_MSG.format(member=after.mention, prefix=PREFIX))
         except discord.errors.Forbidden:
             description = f"{after.mention} has disabled the ability for bots to send them direct messages - **please ask them to add their RSI profile manually with `{PREFIX}profile`**\n{description}"
-        adminchal = CONFIG_COLLECTION.find_one({"_id": "adminchal"})
+        adminchal = GUILD_DB["config"].find_one({"_id": "adminchal"})
         if adminchal:
             channel = after.guild.get_channel(adminchal["channel"])
 
@@ -1313,7 +1392,7 @@ async def on_member_update(before: discord.Member, after: discord.Member) -> Non
                     description=description
                     + "\n".join(
                         f'- {j["text"]}'
-                        for j in JOIN_COLLECTION.find()
+                        for j in GUILD_DB["join"].find()
                         if j["_id"] in after_role_ids
                     ),
                 )
@@ -1364,7 +1443,7 @@ async def on_voice_state_update(
         and before.channel != after.channel
     ):
         await after.channel.edit(status=":siren: LIVE OPERATION !!!")  # type: ignore
-        GUILD_DB = mongodb_client[str(member.guild.id)]
+        GUILD_DB = mongo[str(member.guild.id)]
         COLLECTION = GUILD_DB["config"]
         if bot_voice_id := COLLECTION.find_one({"_id": "botvoice"}):
             bot_voice = member.guild.get_channel(bot_voice_id["value"])

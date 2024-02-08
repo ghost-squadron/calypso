@@ -4,8 +4,7 @@ from classes import Organisation
 from constants import *
 from loguru import logger
 from rsi_profile import org_to_embed
-from snare import (closest_point, is_left_of, line_point_dist,
-                   point_point_dist, pretty_print_dist)
+from snare import Snare, pretty_print_dist
 
 
 class UpdateAllButton(discord.ui.Button):
@@ -88,7 +87,7 @@ class GenericShowEmbedButton(discord.ui.Button):
     def __init__(
         self,
         embed: discord.Embed,
-        view: discord.ui.View,
+        view: discord.ui.View | None,
         label: str,
         style: discord.ButtonStyle,
     ):
@@ -97,12 +96,19 @@ class GenericShowEmbedButton(discord.ui.Button):
         super().__init__(label=label, style=style)
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(
-            delete_after=MESSAGE_TIMEOUT,
-            embed=self.input_embed,
-            view=self.input_view,
-            ephemeral=True,
-        )
+        if self.input_view:
+            await interaction.response.send_message(
+                delete_after=MESSAGE_TIMEOUT,
+                embed=self.input_embed,
+                view=self.input_view,
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                delete_after=MESSAGE_TIMEOUT,
+                embed=self.input_embed,
+                ephemeral=True,
+            )
 
 
 class KickButton(discord.ui.Button):
@@ -136,18 +142,8 @@ class DisplayOrgButton(discord.ui.Button):
 
 
 class SnareCheckModal(discord.ui.Modal):
-    def __init__(
-        self,
-        centerline: tuple[numpy.typing.NDArray, numpy.typing.NDArray],
-        hypotenuse: tuple[numpy.typing.NDArray, numpy.typing.NDArray],
-        physics_range: float,
-        optimal_range: float,
-        title: str,
-    ) -> None:
-        self.centerline = centerline
-        self.hypotenuse = hypotenuse
-        self.physics_range = physics_range
-        self.optimal_range = optimal_range
+    def __init__(self, snare: Snare, title: str) -> None:
+        self.snare = snare
         super().__init__(title=title)
 
         self.add_item(
@@ -160,8 +156,8 @@ class SnareCheckModal(discord.ui.Modal):
             location = numpy.array(
                 [float(l.split(":")[-1]) for l in self.children[0].value.split()[1:]]
             )
-            destination_dist = point_point_dist(location, self.centerline[1])
-            if destination_dist < self.physics_range:
+            route = self.snare.get_route(location)
+            if not route:
                 await interaction.response.send_message(
                     "# ❌ WITHIN PHYSICS GRID!\nPlease reset and try again",
                     ephemeral=True,
@@ -169,54 +165,30 @@ class SnareCheckModal(discord.ui.Modal):
                 )
                 return
 
-            centerline_dist = line_point_dist(self.centerline, location)
-            max_dist = 20_000 - line_point_dist(
-                self.hypotenuse, closest_point(self.centerline, location)
-            )
-
-            if centerline_dist <= max_dist:
-                colour = discord.Colour.green()
+            if route.snare_cone_dist < 0:
                 description = "# ✅ Within snare cone!"
+                colour = discord.Colour.green()
             else:
+                description = f"# ❌ {pretty_print_dist(route.snare_cone_dist)} outside snare cone!"
                 colour = discord.Colour.red()
-                description = f"# ❌ {pretty_print_dist(centerline_dist- max_dist)} outside snare cone!"
-
-            closest_centerline_point = closest_point(self.centerline, location)
-            z_mag = abs(closest_centerline_point[2] - location[2])
-            z_dir = "up" if closest_centerline_point[2] > 0 else "down"
-            s_mag = numpy.linalg.norm((closest_centerline_point - location)[:2])
-            s_dir = "right" if is_left_of(self.centerline, location) else "left"
-            f_mag = (
-                point_point_dist(closest_centerline_point, self.centerline[1])
-                - self.optimal_range
-            )
-            f_dir = "forward" if f_mag > 0 else "backwards"
 
             description += (
                 "\n## Route to centerline:\nFacing your destination and rotated so up for your ship is Stanton north:"
                 + (
-                    f"\n- Travel {pretty_print_dist(abs(z_mag))} {z_dir}"
-                    if abs(z_mag) > 1
+                    f"\n- Travel {pretty_print_dist(abs(route.z_mag))} {route.z_dir}"
+                    if abs(route.z_mag) > 1
                     else ""
                 )
                 + (
-                    f"\n- Travel {pretty_print_dist(abs(s_mag))} {s_dir}"
-                    if abs(s_mag) > 1
+                    f"\n- Travel {pretty_print_dist(abs(route.s_mag))} {route.s_dir}"
+                    if abs(route.s_mag) > 1
                     else ""
                 )
                 + (
-                    f"\n### Final travel to optimal pullout:\n- Travel {pretty_print_dist(abs(f_mag))} {f_dir}"
-                    if abs(f_mag) > 1
+                    f"\n### Final travel to optimal pullout:\n- Travel {pretty_print_dist(abs(route.f_mag))} {route.f_dir}"
+                    if abs(route.f_mag) > 1
                     else ""
                 )
-            )
-
-            closest_edge = min(
-                20_000 - line_point_dist(self.hypotenuse, location),
-                destination_dist - self.physics_range,
-            )
-            location_score = (
-                closest_edge / (self.optimal_range - self.physics_range) * 10
             )
 
             embed = discord.Embed(
@@ -224,13 +196,17 @@ class SnareCheckModal(discord.ui.Modal):
             )
             embed.add_field(
                 name="Distance to centerline",
-                value=pretty_print_dist(centerline_dist),
+                value=pretty_print_dist(route.centerline_dist),
             )
             embed.add_field(
                 name="Distance to Physics Grid",
-                value=pretty_print_dist(destination_dist - self.physics_range),
+                value=pretty_print_dist(
+                    route.destination_dist - route.destination["GRIDRadius"]
+                ),
             )
-            embed.add_field(name="Location score", value=f"{location_score:.1f}/10")
+            embed.add_field(
+                name="Location score", value=f"{route.location_score:.1f}/10"
+            )
             await interaction.response.send_message(
                 embed=embed, ephemeral=True, delete_after=MESSAGE_TIMEOUT
             )
@@ -244,28 +220,11 @@ class SnareCheckModal(discord.ui.Modal):
 
 
 class SnareCheckButton(discord.ui.Button):
-    def __init__(
-        self,
-        centerline: tuple[numpy.typing.NDArray, numpy.typing.NDArray],
-        hypotenuse: tuple[numpy.typing.NDArray, numpy.typing.NDArray],
-        physics_range: float,
-        optimal_range: float,
-        label: str,
-        style: discord.ButtonStyle,
-    ):
-        self.centerline = centerline
-        self.hypotenuse = hypotenuse
-        self.physics_range = physics_range
-        self.optimal_range = optimal_range
+    def __init__(self, snare: Snare, label: str, style: discord.ButtonStyle):
+        self.snare = snare
         super().__init__(label=label, style=style)
 
     async def callback(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_modal(
-            SnareCheckModal(
-                self.centerline,
-                self.hypotenuse,
-                self.physics_range,
-                self.optimal_range,
-                "Check your location",
-            )
+            SnareCheckModal(self.snare, "Check your location")
         )

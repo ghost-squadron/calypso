@@ -3,6 +3,7 @@ import urllib
 
 import discord
 import httpx
+import loguru
 from bs4 import BeautifulSoup, Tag
 from classes import (Activity, Badge, MinOrganisation, Organisation,
                      OrganisationTag, ParsingException, Profile, Rank)
@@ -179,7 +180,11 @@ def orgs_lookup(url: str) -> int | list[Organisation] | MinOrganisation:
 
 
 def extract_profile_info(url: str) -> int | Profile:
-    r = httpx.get(url)
+    try:
+        r = httpx.get(url)
+    except Exception as e:
+        loguru.logger.error(f'Could not get user profile at "{url}": {e}')
+        return -1
 
     if not r.is_success:
         return r.status_code

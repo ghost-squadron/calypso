@@ -78,6 +78,8 @@ markdownify==0.11.6
     # via -r requirements.in
 markupsafe==2.1.3
     # via jinja2
+mathutils==3.3.0
+    # via -r requirements.in
 mpmath==1.3.0
     # via sympy
 multidict==6.0.4
