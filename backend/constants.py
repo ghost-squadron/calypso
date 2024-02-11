@@ -9,8 +9,8 @@ dotenv.load_dotenv()
 
 PREFIX = "/"
 
-DISCORD_API_TOKEN: str = os.environ["DISCORD_API_TOKEN"]
-ELEVENLABS_API_KEY: str = os.environ["ELEVENLABS_API_KEY"]
+DISCORD_API_TOKEN: str = os.environ.get("DISCORD_API_TOKEN", None)
+ELEVENLABS_API_KEY: str = os.environ.get("ELEVENLABS_API_KEY", None)
 RSI_BASE_URL = "https://robertsspaceindustries.com/citizens/"
 MONGODB_DOMAIN = os.environ.get("MONGODB_DOMAIN", default="localhost")
 

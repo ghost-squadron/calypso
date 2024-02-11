@@ -3,7 +3,7 @@ import math
 import numpy
 import numpy.typing
 import pydantic
-from constants import DEFAULT_OM_RADIUS, LOCATIONS
+from .constants import DEFAULT_OM_RADIUS, LOCATIONS
 from mathutils.geometry import intersect_point_line  # type: ignore
 
 
