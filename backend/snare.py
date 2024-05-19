@@ -144,7 +144,7 @@ class Snare:
         # an imaginary abitrary OM point placed perpendicular on the centerline
         # i.e. the worst case in order to catch a potential traveller
         puv = perpendicular_unit_vector(self.destination_point - self.source_point)
-        assert numpy.linalg.norm(puv) == 1.0
+        assert abs(1.0 - numpy.linalg.norm(puv)) < 0.00000000001
         arbitrary_om_point = self.source_point + puv * om_radius
 
         # A linalg representation of an arbitrary worst case travel line
