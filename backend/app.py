@@ -3,6 +3,7 @@ import datetime
 import enum
 import math
 import pathlib
+import re
 import time
 import typing
 import urllib
@@ -10,18 +11,31 @@ import uuid
 
 import discord
 import httpx
+import matplotlib.pyplot
 import numpy
 import pymongo
 from buttons import (DisplayOrgButton, GenericShowEmbedButton, KickButton,
                      SnareCheckButton, UpdateAllButton)
 from classes import Organisation, ParsingException, Profile
 from constants import *
+from dateutil.relativedelta import relativedelta
+from langchain_chroma import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.documents import Document
 from loguru import logger
+from numpy import linspace, loadtxt
+from readable_number import ReadableNumber  # type: ignore
 from rsi_profile import (extract_profile_info, org_to_embed, orgs_lookup,
                          profile_to_embed, url_to_org)
 from snare import (Snare, line_point_dist, location_to_str, point_point_dist,
                    pretty_print_dist)
 
+EMBEDDINGS = HuggingFaceEmbeddings(model_name="sentence-transformers/sentence-t5-xxl")
+COMMODITIES_DB = Chroma.from_documents(
+    [Document(page_content=c) for c in COMMODITIES],
+    EMBEDDINGS,
+    collection_name="commodities",
+)
 mongo: pymongo.MongoClient = pymongo.MongoClient(MONGODB_DOMAIN, 27017)
 
 client = discord.Client(command_prefix=PREFIX, intents=discord.Intents.all())
@@ -216,6 +230,7 @@ async def snare(
         name=f'"{location_to_str(snare.destination)}" physics grid range',
         value=pretty_print_dist(snare.destination["GRIDRadius"]),
     )
+    embed.set_footer(text=f"{source.name},{destination.name}")
     if snare.coverage >= 1:
         embed.add_field(
             name="Earliest pullout", value=pretty_print_dist(snare.min_pullout_dist)
@@ -398,7 +413,7 @@ async def bot_help(interaction: discord.Interaction) -> None:
 
 class Vote(enum.Enum):
     Nay = 0
-    Yay = 1
+    Aye = 1
 
 
 @tree.command(
@@ -408,8 +423,8 @@ class Vote(enum.Enum):
 async def feedback(
     interaction: discord.Interaction,
     member: discord.Member,
-    feedback: str | None,
-    vote: Vote | None,
+    vote: Vote,
+    written_feedback: str | None,
 ) -> None:
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message(
@@ -426,8 +441,8 @@ async def feedback(
 
     initial = COLLECTION.find_one({"_id": member.id}) or {}
     new = {**initial}
-    if feedback is not None:
-        new["feedback"] = feedback
+    if written_feedback is not None:
+        new["feedback"] = written_feedback
     if vote is not None:
         new["vote"] = vote.value
 
@@ -452,8 +467,16 @@ async def feedback(
     await interaction.followup.send(
         embed=discord.Embed(
             description=f"# {member.mention}"
-            + (f" - Vote: {Vote(new['vote']).name}" if new["vote"] != None else "")
-            + (f'\n{new["feedback"]}' if new["feedback"] != None else ""),
+            + (
+                f" - Vote: {Vote(new['vote']).name}"
+                if "vote" in new and new["vote"] != None
+                else ""
+            )
+            + (
+                f'\n{new["feedback"]}'
+                if "feedback" in new and new["feedback"] != None
+                else ""
+            ),
         ),
         ephemeral=True,
     )
@@ -479,29 +502,61 @@ async def myfeedback(
     GUILD_DB = mongo[str(interaction.guild.id)]
     COLLECTION = GUILD_DB[f"feedback-{interaction.user.id}"]
 
+    feedbacks = [
+        f"# <@{m['_id']}>"
+        + (f" - Vote: {Vote(m['vote']).name}" if "vote" in m and m["vote"] else "")
+        + (f'\n{m["feedback"]}' if "feedback" in m and m["feedback"] else "")
+        for m in COLLECTION.find()
+        if not member or member.id == m["_id"]
+    ]
     await interaction.followup.send(
         embed=discord.Embed(
-            description="\n".join(
-                f"# <@{m['_id']}>"
-                + (f" - Vote: {Vote(m['vote']).name}" if m["vote"] != None else "")
-                + (f'\n{m["feedback"]}' if m["feedback"] != None else "")
-                for m in COLLECTION.find()
-                if not member or member.id == m["_id"]
-            ),
+            description="\n".join(feedbacks) if feedbacks else "No feedback given yet",
         ),
         ephemeral=True,
     )
 
 
 # ======== ADMIN COMMANDS ========
-CURRENT_OPS = {}
+CURRENT_OPS: dict = {}
+
+
+@tree.command(name="talk", description="Make Calypso talk")
+async def talk(
+    interaction: discord.Interaction, channel: discord.VoiceChannel, text: str
+) -> None:
+    if not is_admin(interaction):
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    audio_file = elevenlabs_tts(text, VOICE_IDS["Dooley"])
+    if audio_file:
+        voice_client: discord.VoiceClient = await channel.connect()
+        time.sleep(1)  # Wait for client to join
+        after_talk = AfterTalkAction(voice_client)
+        try:
+            voice_client.play(
+                discord.FFmpegOpusAudio(str(audio_file.absolute())),
+                after=after_talk.after,
+            )
+        except discord.errors.ClientException:
+            voice_client.pause()
+            voice_client.play(
+                discord.FFmpegOpusAudio(str(audio_file.absolute())),
+                after=after_talk.after,
+            )
+
+    await interaction.followup.send(
+        f'Talked in {channel.mention}: "{text}"', ephemeral=True
+    )
 
 
 @tree.command(name="adminprofile", description="Set RSI profiles for specific user")
 async def adminprofile(
     interaction: discord.Interaction, member: discord.Member, username: str
 ) -> None:
-    if not interaction.guild:
+    if not interaction.guild or not is_admin(interaction):
         return
 
     await interaction.response.defer(thinking=True, ephemeral=True)
@@ -544,6 +599,52 @@ async def adminprofile(
         )
 
 
+def memberfeedback(
+    member: str, GUILD_DB: typing.Any, member_count: int
+) -> discord.Embed | None:
+    description = ""
+    ayes = 0
+    nays = 0
+    for collection_name in GUILD_DB.list_collection_names():
+        if "feedback-" in collection_name and (
+            f := GUILD_DB[collection_name].find_one({"_id": member})
+        ):
+            member_id = collection_name.split("-")[-1]
+            vote = Vote(f["vote"])
+            if vote == Vote.Aye:
+                ayes += 1
+            else:
+                nays += 1
+            description += (
+                f"\n## Giver: <@{member_id}>"
+                + (f" | Vote: {vote.name}" if "vote" in f and f["vote"] != None else "")
+                + (
+                    f'\n{f["feedback"]}'
+                    if "feedback" in f and f["feedback"] != None
+                    else ""
+                )
+            )
+
+    if not description:
+        return None
+
+    embed = discord.Embed(description=f"# Feedback for <@{member}>:\n{description}")
+
+    aye_percent = f"{ayes/member_count*100:.1f}%"
+    nay_percent = f"{nays/member_count*100:.1f}%"
+    undecided_percent = f"{(member_count - ayes - nays)/member_count*100:.1f}%"
+
+    embed.add_field(name="Ayes", value=f"{ayes}/{member_count} ({aye_percent})")
+    embed.add_field(name="Nays", value=f"{nays}/{member_count} ({nay_percent})")
+    if ayes / member_count >= 2 / 3:
+        embed.add_field(name="Result", value=f"✅ - {aye_percent} >= 2/3 ayes")
+    elif nays / member_count > 1 / 3:
+        embed.add_field(name="Result", value=f"❌ - {nay_percent} > 1/3 nays")
+    else:
+        embed.add_field(name="Result", value=f"❓ - {undecided_percent} still undecided")
+    return embed
+
+
 @tree.command(
     name="allfeedback",
     description="List all feedback. Either in total or given to a specific member",
@@ -551,7 +652,11 @@ async def adminprofile(
 async def allfeedback(
     interaction: discord.Interaction, member: discord.Member | None
 ) -> None:
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+    if (
+        not interaction.guild
+        or not isinstance(interaction.user, discord.Member)
+        or not await check_admin(interaction)
+    ):
         return
 
     await interaction.response.defer(thinking=True, ephemeral=True)
@@ -565,39 +670,30 @@ async def allfeedback(
         )
         return
 
+    tm = len(
+        [
+            m
+            for m in interaction.guild.members
+            if any(r for r in m.roles if r.id == 1018613946124607549)
+        ]
+    )
     embeds = []
     if member:
-        description = f"# Feedback for {member.mention}:"
-        for collection_name in GUILD_DB.list_collection_names():
-            if "feedback-" in collection_name and (
-                f := GUILD_DB[collection_name].find_one({"_id": member.id})
-            ):
-                member_id = collection_name.split("-")[-1]
-                description += (
-                    f"\n## Giver: <@{member_id}>"
-                    + (f" | Vote: {Vote(f['vote']).name}" if f["vote"] != None else "")
-                    + (f'\n{f["feedback"]}' if f["feedback"] != None else "")
-                )
-        description = (
-            description.strip() or f"No feedback given for {member.mention} yet"
+        embeds.append(
+            memberfeedback(str(member.id), GUILD_DB, tm)
+            or discord.Embed(description=f"No feedback given for {member.mention} yet")
         )
-        embeds.append(discord.Embed(description=description))
+
     else:
+        already_given = set()
         for collection_name in GUILD_DB.list_collection_names():
             if "feedback-" in collection_name:
-                description = f'# Feedback for <@{collection_name.split("-")[-1]}>'
                 for f in GUILD_DB[collection_name].find():
-                    description += (
-                        f"\n## Giver: <@{f['_id']}>"
-                        + (
-                            f" | Vote: {Vote(f['vote']).name}"
-                            if f["vote"] != None
-                            else ""
-                        )
-                        + (f'\n{f["feedback"]}' if f["feedback"] != None else "")
-                    )
-                if description:
-                    embeds.append(discord.Embed(description=description))
+                    if f["_id"] not in already_given and (
+                        embed := memberfeedback(f["_id"], GUILD_DB, tm)
+                    ):
+                        embeds.append(embed)
+                        already_given.add(f["_id"])
 
     if embeds:
         await interaction.followup.send(embeds=embeds, ephemeral=True)
@@ -665,6 +761,32 @@ async def feedbackchannel(
     )
 
 
+def elevenlabs_tts(
+    text: str, voice_id: str, model_id: str = "eleven_multilingual_v1"
+) -> pathlib.Path | None:
+    if not ELEVENLABS_API_KEY:
+        return None
+
+    response = httpx.post(
+        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+        json={"model_id": model_id, "text": text},
+        headers={
+            "Accept": "audio/mpeg",
+            "Content-Type": "application/json",
+            "xi-api-key": ELEVENLABS_API_KEY,
+        },
+        timeout=5 * 60,
+    )
+    if not response.is_success:
+        logger.warning(response)
+        logger.warning(response.text)
+        return None
+    audio_file = AUDIO_DIR / f"{uuid.uuid4()}.mp3"
+    with open(audio_file, "wb") as f:
+        f.write(response.content)
+    return audio_file
+
+
 @tree.command(
     name="startop",
     description="Starts an operation in a specific Voice Channel",
@@ -683,29 +805,11 @@ async def startop(
 
     GUILD_DB = mongo[str(interaction.guild.id)]
     COLLECTION = GUILD_DB["ops"]
-    VOICE_IDS = {"Dorothy": "ThT5KcBeYPX3keUQqHPh", "Grace": "oWAxZDx7w5VEj9dCyTzz"}
 
     if description := COLLECTION.find_one({"_id": lookup}):
         text = f'An active operation is currently underway in "{channel.name.split("・")[-1]}".\n\n{description["description"]}\n\nIf you are not interested in participating in this operation please leave the voice channel. However, if you are, remember to respect ranks and good luck!'
-        response = httpx.post(
-            f'https://api.elevenlabs.io/v1/text-to-speech/{VOICE_IDS["Dorothy"]}',
-            json={"model_id": "eleven_multilingual_v1", "text": text},
-            headers={
-                "Accept": "audio/mpeg",
-                "Content-Type": "application/json",
-                "xi-api-key": ELEVENLABS_API_KEY,
-            },
-            timeout=5 * 60,
-        )
-        if not response.is_success:
-            logger.warning(response)
-            logger.warning(response.text)
-            return
-        audio_file = AUDIO_DIR / f"{uuid.uuid4()}.mp3"
-        with open(audio_file, "wb") as f:
-            f.write(response.content)
         CURRENT_OPS[str(channel.id)] = {
-            "audio_file": audio_file,
+            "audio_file": elevenlabs_tts(text, VOICE_IDS["Dooley"]),
             "informed_members": [],
             "voice_client": None,
             "afters": [],
@@ -1344,6 +1448,359 @@ async def listtriggers(interaction: discord.Interaction) -> None:
     )
 
 
+@tree.command(
+    name="donation",
+    description='Add a "donation"',
+)
+@discord.app_commands.describe(
+    booty='A comma-separated list of donated goods, for instance, "72 RMC 766000, 100SCU of Gold for 670000 aUEC"',
+    collectors='A list of all discord participants, for instance, "@User1 @UserTwo @Me"',
+    ship="The ship flown by the target",
+    owner='The username of the target, for instance, "bobBobberson42"',
+    location='The location where the donation was received, for instance, "Hurston, Pickers Field"',
+    method='The method used for the donation, for instance, "Extorsion"',
+    date='Timestamp for donation collection in ISO 8601 format, for instance, "2024-05-25T07:30+01:00"',
+)
+async def donation(
+    interaction: discord.Interaction,
+    booty: str,
+    collectors: str,
+    ship: Ship | None = None,
+    owner: str | None = None,
+    location: str | None = None,
+    method: str | None = None,
+    date: str | None = None,
+) -> None:
+    if not isinstance(interaction.guild, discord.Guild):
+        await interaction.response.send_message(
+            "Command only available inside guild",
+            ephemeral=True,
+            delete_after=MESSAGE_TIMEOUT,
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    members = [m for m in interaction.guild.members if str(m.id) in collectors]
+
+    if not members:
+        return await interaction.followup.send(
+            embed=discord.Embed(
+                title="Error",
+                description=f'No Discord members found in "{collectors}". `collectors` must be a list of discord participants, for instance, "<@> <@>"',
+                colour=discord.Colour.red(),
+            )
+        )
+
+    try:
+        now = (
+            datetime.datetime.fromisoformat(date.replace(" ", ""))
+            if date
+            else datetime.datetime.utcnow().replace(second=0, microsecond=0)
+        )
+    except ValueError as e:
+        return await interaction.followup.send(
+            embed=discord.Embed(
+                title="Error",
+                description=f'{e}. If date is specified, it must be in ISO 8601 format, for instance, "2024-05-25T07:30+01:00"',
+                colour=discord.Colour.red(),
+            )
+        )
+
+    parsed_donations = []
+    for d in booty.split(","):
+        while "  " in d:
+            d = d.replace("  ", " ")
+        d = d.replace(",", "")
+
+        if not re.match(r"\d+\D+\d+", d):
+            return await interaction.followup.send(
+                embed=discord.Embed(
+                    title="Error",
+                    description=f'Booty `{d}` is incorrectly formatted. `booty` must be a comma-separated list of donated goods on the format "amount" followed by "material" followed by "sell price", for instance, `72 RMC 766000, 100SCU of Gold for 670000 aUEC`. You can add units and filler words like "aUEC", "of" and "for" if it makes it easier for you, but I do not care.',
+                    colour=discord.Colour.red(),
+                )
+            )
+
+        _, tmp_amount, right = re.split(r"(\d+)", d, 1)
+        commodity, tmp_profit, _ = re.split(r"(\d+)", right, 1)
+        commodity = commodity.strip()
+        amount = int(tmp_amount)
+        profit = int(tmp_profit)
+
+        parsed_donations.append(
+            {
+                "commodity": COMMODITIES_DB.similarity_search(commodity)[
+                    0
+                ].page_content,
+                "amount": amount,
+                "profit": profit,
+            }
+        )
+
+    document = {
+        "_id": now,
+        "booty": parsed_donations,
+        "collectors": [m.id for m in members],
+    }
+    if ship:
+        document["ship"] = {
+            "name": ship,
+            "icon_url": f"https://public.hutli.hu/sc/{ship.split()[0].lower()}-circle.png",
+        }
+
+    if owner:
+        document["owner"] = owner
+    if location:
+        document["location"] = location
+    if method:
+        document["method"] = method
+
+    document["creator"] = interaction.user.id
+
+    COLLECTION = mongo[str(interaction.guild.id)]["donations"]
+    COLLECTION.insert_one(document)
+    embed = discord.Embed(
+        title=f"Donation: {pretty_money(total_profit(document))}",
+        description="- "
+        + "\n- ".join(
+            f'{d["amount"]}SCU of {d["commodity"]} for {pretty_money(d["profit"])}'  # type: ignore
+            for d in parsed_donations
+        )
+        + "\n\n**Collectors:** "
+        + ",".join([f"<@{m.id}>" for m in members]),
+        timestamp=now,
+        colour=discord.Colour.red(),
+    )
+    embed.set_footer(text=f"ID: {int(now.timestamp())}")
+    if "owner" in document:
+        embed.add_field(name="Owner", value=document["owner"])
+    if "location" in document:
+        embed.add_field(name="Location", value=document["location"])
+    if "method" in document:
+        embed.add_field(name="Method", value=document["method"])
+
+    to_send = total_profit(document) / (
+        TRANSFER_FEE * (len(members) - 1) + len(members)
+    )
+
+    embed.add_field(name="To send", value=f"{int(to_send)} aUEC")
+    if "ship" in document:
+        embed.set_author(
+            name=document["ship"]["name"], icon_url=document["ship"]["icon_url"]  # type: ignore
+        )
+    await interaction.followup.send(embed=embed)
+
+
+def total_profit(donation: dict) -> float:
+    return float(sum(d["profit"] for d in donation["booty"]))
+
+
+def pretty_number(number: float, precision: int = 2) -> str:
+    return str(ReadableNumber(number, use_shortform=True, precision=precision))
+
+
+def pretty_money(number: float, precision: int = 2, unit: str = "aUEC") -> str:
+    return f"{pretty_number(number, precision)} {unit}".strip()
+
+
+def donations_to_desc(
+    title: str, donations: list[dict], show_donations: bool = False
+) -> str:
+    if not donations:
+        return ""
+    desc = f"{title} `{pretty_money(sum(total_profit(d) for d in donations))}`"
+    if show_donations:
+        desc += ":\n\n- " + "\n- ".join(
+            [
+                f'{d["_id"].strftime("%d %b %Y")}: {pretty_money(total_profit(d))} (ID: `{int(d["_id"].timestamp())}`)'
+                for d in donations
+            ]
+        )
+    return desc
+
+
+@tree.command(
+    name="donations",
+    description="Current donation overview",
+)
+async def donations(interaction: discord.Interaction) -> None:
+    if not isinstance(interaction.guild, discord.Guild):
+        await interaction.response.send_message(
+            "Command only available inside guild",
+            ephemeral=True,
+            delete_after=MESSAGE_TIMEOUT,
+        )
+        return
+
+    COLLECTION = mongo[str(interaction.guild.id)]["donations"]
+    if COLLECTION is not None:
+        now = datetime.datetime.utcnow()
+
+        last_24hr = []
+        last_7_days = []
+        this_month = []
+        this_year = []
+        yesterday = []
+        last_month = []
+        last_year = []
+        total = []
+        total_sums = []
+        running_total = 0.00
+        member_rankings = {}
+        ship_rankings = {}
+
+        for d in sorted(COLLECTION.find(), key=lambda c: c["_id"]):
+            tp = total_profit(d)
+            running_total += tp
+            total_sums.append((d["_id"], running_total))
+            profit_share = tp / len(d["collectors"])
+            for p in d["collectors"]:
+                if p not in member_rankings:
+                    member_rankings[p] = 0.0
+                member_rankings[p] += profit_share
+
+            if "ship" in d:
+                if d["ship"]["name"] not in ship_rankings:
+                    ship_rankings[d["ship"]["name"]] = 0.0
+                ship_rankings[d["ship"]["name"]] += tp
+
+            total.append(d)
+            if d["_id"].year == now.year:
+                this_year.append(d)
+                if d["_id"].month == now.month:
+                    this_month.append(d)
+
+            if (now - relativedelta(hours=24)) < d["_id"]:
+                last_24hr.append(d)
+            if (now - relativedelta(days=7)) < d["_id"]:
+                last_7_days.append(d)
+            if (now - relativedelta(days=1)).date == d["_id"].date:
+                yesterday.append(d)
+            if (now - relativedelta(month=1)).year == d["_id"].year and (
+                now - relativedelta(month=1)
+            ).month == d["_id"].month:
+                last_month.append(d)
+            if (now - relativedelta(years=1)).year == d["_id"].year:
+                last_year.append(d)
+
+        x = [i for i, _ in total_sums]
+        y = [t for _, t in total_sums]
+
+        fig, ax = matplotlib.pyplot.subplots()
+        img_png = f"{int(now.timestamp())}.png"
+
+        ax.plot(x, y, "r")
+        ax.get_yaxis().set_major_formatter(lambda d, _: pretty_number(d))
+        fig.autofmt_xdate()
+        fig.savefig(img_png)
+
+        os.system(f"curl https://upload.hutli.hu/sc/ --upload-file {img_png}")
+
+        mr = sorted(member_rankings.items(), key=lambda t: t[1], reverse=True)
+        sr = sorted(ship_rankings.items(), key=lambda t: t[1], reverse=True)
+        embed = discord.Embed(
+            title="",
+            description=f"# All time total: `{pretty_money(sum([total_profit(t) for t in total]))}`"
+            + donations_to_desc("\n## Last 24 Hours:", last_24hr)
+            + donations_to_desc("\n**Last 7 Days**:", last_7_days)
+            + donations_to_desc("\n**Yesterday**:", yesterday)
+            + donations_to_desc("\n**This Month**:", this_month)
+            + donations_to_desc("\n**Last Month**:", last_month)
+            + donations_to_desc("\n**This Year**:", this_year)
+            + donations_to_desc("\n**Last Year**:", last_year)
+            + f"\n# Rich MFs:\n🥇 <@{mr[0][0]}> ({pretty_money(mr[0][1])})\n🥈 <@{mr[1][0]}> ({pretty_money(mr[1][1])})\n🥉 <@{mr[2][0]}> ({pretty_money(mr[2][1])})"
+            + f"\n# Donation Ships:\n🥇 {sr[0][0]} ({pretty_money(sr[0][1])})\n🥈 {sr[1][0]} ({pretty_money(sr[1][1])})\n🥉 {sr[2][0]} ({pretty_money(sr[2][1])})",
+        )
+        embed.set_image(url=f"https://public.hutli.hu/sc/{img_png}")
+        await interaction.response.send_message(embed=embed)
+    else:
+        await interaction.response.send_message(
+            embed=discord.Embed(title='No "donations" yet...')
+        )
+
+
+@tree.command(
+    name="deldonation",
+    description='Delete a "donation", if no "donation_id" is specified the latest donation is deleted',
+)
+@discord.app_commands.describe(donation_id="The ID of the donation to delete")
+async def deldonation(
+    interaction: discord.Interaction, donation_id: str | None
+) -> None:
+    if not isinstance(interaction.guild, discord.Guild):
+        return await interaction.response.send_message(
+            "Command only available inside guild",
+            ephemeral=True,
+            delete_after=MESSAGE_TIMEOUT,
+        )
+
+    COLLECTION = mongo[str(interaction.guild.id)]["donations"]
+    if COLLECTION is None:
+        return await interaction.response.send_message(
+            "No donations yet...", ephemeral=True, delete_after=MESSAGE_TIMEOUT
+        )
+
+    if donation_id:
+        if match := re.match(r"\d+(\.\d+)?", donation_id):
+            donation_time = datetime.datetime.fromtimestamp(float(match.group()))
+        else:
+            return await interaction.response.send_message(
+                f'Could not find an ID inside the string "{donation_id}"',
+                ephemeral=True,
+                delete_after=MESSAGE_TIMEOUT,
+            )
+    else:
+        donation_time = sorted(
+            d["_id"] for d in mongo[str(interaction.guild.id)]["donations"].find()
+        )[-1]
+
+    to_delete = COLLECTION.find_one({"_id": donation_time})
+    if not to_delete:
+        return await interaction.response.send_message(
+            f'Could not find donation "{int(donation_time.timestamp())}"',
+            ephemeral=True,
+            delete_after=MESSAGE_TIMEOUT,
+        )
+
+    if (
+        "creator" in to_delete
+        and to_delete["creator"] != interaction.user.id
+        and not is_admin(interaction)
+    ):
+        return await interaction.response.send_message(
+            f"Only <@{to_delete['creator']}> and admins can delete this donation",
+            ephemeral=True,
+            delete_after=MESSAGE_TIMEOUT,
+        )
+
+    res = COLLECTION.delete_one(to_delete)
+    if res.deleted_count:
+        total = 0
+        if isinstance(interaction.channel, discord.TextChannel):
+            async for m in interaction.channel.history(limit=None):
+                if (
+                    m.author == client.user
+                    and m.embeds
+                    and str(int(donation_time.timestamp()))
+                    in (m.embeds[0].footer.text or "")
+                ):
+                    await m.delete()
+                    total += 1
+
+        await interaction.response.send_message(
+            f'Deleted donation "{int(donation_time.timestamp())}" and {total} message(s)',
+            ephemeral=True,
+            delete_after=MESSAGE_TIMEOUT,
+        )
+    else:
+        await interaction.response.send_message(
+            f'Could not delete donation "{int(donation_time.timestamp())}" - please contact an admin',
+            ephemeral=True,
+            delete_after=MESSAGE_TIMEOUT,
+        )
+
+
 # ======== EVENTS ========
 @client.event
 async def on_member_update(before: discord.Member, after: discord.Member) -> None:
@@ -1402,6 +1859,14 @@ async def on_member_update(before: discord.Member, after: discord.Member) -> Non
                 )
 
 
+class AfterTalkAction:
+    def __init__(self, voice_client: discord.VoiceClient):
+        self.voice_client = voice_client
+
+    def after(self, error: Exception | None) -> None:
+        asyncio.run_coroutine_threadsafe(self.voice_client.disconnect(), client.loop)
+
+
 class AfterPlaybackAction:
     def __init__(
         self,
@@ -1419,7 +1884,7 @@ class AfterPlaybackAction:
         if error:
             logger.error(error)
 
-        CURRENT_OPS[str(self.ops_channel.id)]["informed_members"].append(self.member.id)  # type: ignore
+        CURRENT_OPS[str(self.ops_channel.id)]["informed_members"].append(self.member.id)
         asyncio.run_coroutine_threadsafe(
             self.member.move_to(self.ops_channel), client.loop
         )
@@ -1439,7 +1904,7 @@ async def on_voice_state_update(
     if (
         isinstance(after.channel, discord.VoiceChannel)
         and str(after.channel.id) in CURRENT_OPS
-        and member.id not in CURRENT_OPS[str(after.channel.id)]["informed_members"]  # type: ignore
+        and member.id not in CURRENT_OPS[str(after.channel.id)]["informed_members"]
         and before.channel != after.channel
     ):
         await after.channel.edit(status=":siren: LIVE OPERATION !!!")  # type: ignore
@@ -1465,11 +1930,9 @@ async def on_voice_state_update(
                 assert isinstance(audio_file, pathlib.Path)
                 assert isinstance(voice_client, discord.VoiceClient)
                 after_play = AfterPlaybackAction(
-                    member,
-                    ops_channel,
-                    CURRENT_OPS[str(ops_channel.id)]["afters"],  # type: ignore
+                    member, ops_channel, CURRENT_OPS[str(ops_channel.id)]["afters"]
                 )
-                CURRENT_OPS[str(ops_channel.id)]["afters"].append(after_play)  # type: ignore
+                CURRENT_OPS[str(ops_channel.id)]["afters"].append(after_play)
                 time.sleep(1)  # Wait for client to join
                 try:
                     voice_client.play(
@@ -1495,4 +1958,5 @@ async def on_ready() -> None:
     )
 
 
-client.run(DISCORD_API_TOKEN)
+if DISCORD_API_TOKEN:
+    client.run(DISCORD_API_TOKEN)

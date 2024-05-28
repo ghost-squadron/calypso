@@ -1,6 +1,7 @@
 import json
 import os
 import pathlib
+import typing
 
 import discord
 import dotenv
@@ -9,10 +10,11 @@ dotenv.load_dotenv()
 
 PREFIX = "/"
 
-DISCORD_API_TOKEN: str = os.environ.get("DISCORD_API_TOKEN", None)
-ELEVENLABS_API_KEY: str = os.environ.get("ELEVENLABS_API_KEY", None)
+DISCORD_API_TOKEN: str | None = os.environ.get("DISCORD_API_TOKEN", None)
+ELEVENLABS_API_KEY: str | None = os.environ.get("ELEVENLABS_API_KEY", None)
 RSI_BASE_URL = "https://robertsspaceindustries.com/citizens/"
 MONGODB_DOMAIN = os.environ.get("MONGODB_DOMAIN", default="localhost")
+TRANSFER_FEE = 0.005
 
 # Command descriptions
 PROFILE_DESCRIPTION = "Add/update your linked RSI profile"
@@ -56,3 +58,82 @@ ACTIVITY_LOOKUP = {
 AUDIO_DIR = pathlib.Path("audio")
 AUDIO_DIR.mkdir(exist_ok=True)
 CHUNK_SIZE = 1024
+
+VOICE_IDS = {
+    "Dorothy": "ThT5KcBeYPX3keUQqHPh",
+    "Grace": "oWAxZDx7w5VEj9dCyTzz",
+    "Dooley": "5G7PW5XIusZbDc52ep63",
+}
+
+COMMODITIES = [
+    "AcryliPlex Composite",
+    "Agricium",
+    "Agricultural Supplies",
+    "Altruciatoxin",
+    "Aluminum",
+    "Astatine",
+    "Beryl",
+    "Bexalite",
+    "Borase",
+    "Chlorine",
+    "Compboard",
+    "Copper",
+    "Corundum",
+    "Diamond",
+    "Diluthermex",
+    "Distilled Spirits",
+    "E'tam",
+    "Extortion",
+    "Fluorine",
+    "Gold",
+    "Hephaestanite",
+    "Hydrogen",
+    "Iodine",
+    "Laranite",
+    "Maze",
+    "Medical Supplies",
+    "Neon",
+    "Processed Food",
+    "Quantainium",
+    "Quartz",
+    "Red Festival Envelope",
+    "Revenant Tree Pollen",
+    "RMC (Recycled Material Composite)",
+    "Scrap",
+    "SLAM",
+    "Stims",
+    "Taranite",
+    "Titanium",
+    "Tungsten",
+    "Waste",
+    "WiDoW",
+    "Zeta-Prolanide",
+]
+
+Ship = typing.Literal[
+    "Aegis Hammerhead",
+    "Aegis Reclaimer",
+    "Anvil Carrack",
+    "Anvil Valkyrie",
+    "Argo MOLE",
+    "Argo RAFT",
+    "CNOU Nomad",
+    "Crusader A2 Hercules Starlifter",
+    "Crusader C1 Spirit",
+    "Crusader C2 Hercules Starlifter",
+    "Crusader M2 Hercules Starlifter",
+    "Crusader Mercury Star Runner",
+    "Drake Caterpillar",
+    "Drake Corsair",
+    "Drake Cutlass",
+    "Drake Vulture",
+    "MISC Freelancer",
+    "MISC Hull A",
+    "MISC Hull C",
+    "MISC Starfarer",
+    "Origin 400i",
+    "Origin 600i Touring",
+    "Origin 600i",
+    "Origin 890 Jump",
+    "RSI Constellation",
+]

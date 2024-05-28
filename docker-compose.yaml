@@ -1,5 +1,3 @@
-version: "3"
-
 services:
   gsag-calypso:
     build: .
@@ -12,8 +10,23 @@ services:
     depends_on:
       - mongodb
 
+  gsag-calypso-api:
+    build: api
+    image: gsag-calypso-api
+    environment:
+      MONGODB_DOMAIN: "mongodb"
+    ports:
+      - 4145:80
+    restart: "unless-stopped"
+    networks:
+      - gsag-calypso
+    depends_on:
+      - mongodb
+
   mongodb:
     image: mongo:6-jammy
+    ports:
+      - "127.0.0.1:27017:27017"
     expose:
       - 27017
     volumes:
